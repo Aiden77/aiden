@@ -1,0 +1,1447 @@
+"""
+Slack 알림 모니터링 웹 애플리케이션
+실시간 멘션 알림, 채널 메시지 조회, 사용자 관리 기능 제공
+"""
+
+import sys
+import io
+
+# Windows 인코딩 문제 해결
+if sys.platform == 'win32':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
+from flask import Flask, render_template, request, jsonify, Response, session
+import requests
+import json
+import time
+from datetime import datetime
+import threading
+import os
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
+import re
+
+app = Flask(__name__)
+app.secret_key = os.urandom(24)  # 세션 암호화 키
+
+# 전역 변수
+monitoring_active = {}  # 사용자별 모니터링 상태
+last_check_times = {}  # 사용자별 마지막 체크 시간
+notification_queues = {}  # 사용자별 알림 큐
+
+# 전역 캐시 (메모리 기반, TTL 포함)
+_global_user_cache = {}  # {user_id: {"data": user_info, "timestamp": time}}
+_global_bot_cache = {}   # {bot_id: {"data": bot_info, "timestamp": time}}
+_global_channel_cache = {}  # {token: {"data": channels, "timestamp": time}}
+_global_users_list_cache = {}  # {token: {"data": members, "timestamp": time}}
+CACHE_TTL = 300  # 5분 TTL
+USERS_LIST_CACHE_TTL = 600  # 10분 TTL (users.list는 덜 자주 변경됨)
+
+# 스레드 풀 (병렬 처리용)
+executor = ThreadPoolExecutor(max_workers=10)
+
+# 캐시 정리 함수
+def cleanup_expired_caches():
+    """만료된 캐시 항목 정리"""
+    current_time = time.time()
+
+    # User 캐시 정리
+    expired_users = [uid for uid, cached in _global_user_cache.items()
+                     if current_time - cached["timestamp"] > CACHE_TTL]
+    for uid in expired_users:
+        del _global_user_cache[uid]
+
+    # Bot 캐시 정리
+    expired_bots = [bid for bid, cached in _global_bot_cache.items()
+                    if current_time - cached["timestamp"] > CACHE_TTL]
+    for bid in expired_bots:
+        del _global_bot_cache[bid]
+
+    # Channel 캐시 정리
+    expired_channels = [token for token, cached in _global_channel_cache.items()
+                        if current_time - cached["timestamp"] > CACHE_TTL]
+    for token in expired_channels:
+        del _global_channel_cache[token]
+
+    # Users list 캐시 정리
+    expired_users_list = [token for token, cached in _global_users_list_cache.items()
+                          if current_time - cached["timestamp"] > USERS_LIST_CACHE_TTL]
+    for token in expired_users_list:
+        del _global_users_list_cache[token]
+
+# 캐시 정리를 주기적으로 실행
+def cache_cleanup_thread():
+    """백그라운드에서 주기적으로 캐시 정리"""
+    while True:
+        time.sleep(600)  # 10분마다
+        cleanup_expired_caches()
+
+# 캐시 정리 스레드 시작
+cleanup_thread = threading.Thread(target=cache_cleanup_thread, daemon=True)
+cleanup_thread.start()
+
+
+class SlackNotifier:
+    def __init__(self, token):
+        self.token = token
+        self.headers = {"Authorization": f"Bearer {token}"}
+        self.bot_user_id = None
+        self.watched_users = []
+        self.watched_user_ids = []  # username을 user_id로 변환한 캐시
+        self.team_url = None  # 워크스페이스 URL
+        # 정규표현식 컴파일 (성능 향상)
+        self.mention_pattern = re.compile(r'<@([A-Z0-9]+)>')
+        # HTTP 세션 재사용 (연결 풀링으로 성능 향상)
+        self.session = requests.Session()
+        self.session.headers.update(self.headers)
+        # User Group 캐시 (ID -> handle 매핑)
+        self._usergroups_cache = {}  # {subteam_id: handle}
+        self._usergroups_cache_time = 0  # 캐시 생성 시간
+        self._usergroups_cache_ttl = 600  # 10분 TTL
+        # User Group 멤버 캐시 (ID -> members 매핑)
+        self._usergroup_members_cache = {}  # {subteam_id: [user_ids]}
+        self._usergroup_members_cache_time = {}  # {subteam_id: timestamp}
+        self._usergroup_members_cache_ttl = 300  # 5분 TTL
+
+    def test_connection(self):
+        """Slack 연결 테스트 및 봇 정보 가져오기"""
+        try:
+            response = self.session.get("https://slack.com/api/auth.test")
+            data = response.json()
+
+            print(f"\n=== auth.test 응답 ===")
+            print(f"Response: {data}")
+            print(f"=" * 50)
+
+            if data.get("ok"):
+                self.bot_user_id = data.get("user_id")
+                # 워크스페이스 URL 저장 (https://[team].slack.com)
+                self.team_url = data.get("url", "")
+                print(f"✅ 연결 성공! user_id={self.bot_user_id}, user={data.get('user')}, team_url={self.team_url}")
+                return {
+                    "success": True,
+                    "bot_id": self.bot_user_id,
+                    "user": data.get("user"),
+                    "team": data.get("team"),
+                    "team_url": self.team_url
+                }
+            else:
+                return {
+                    "success": False,
+                    "error": data.get("error", "Unknown error")
+                }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": str(e)
+            }
+
+    def get_message_link(self, channel_id, timestamp):
+        """Slack 메시지 링크 생성"""
+        if not self.team_url or not channel_id or not timestamp:
+            return None
+
+        # timestamp를 Slack 링크 형식으로 변환 (점을 제거하고 p 추가)
+        # 예: 1234567890.123456 -> p1234567890123456
+        ts_for_link = "p" + timestamp.replace(".", "")
+
+        # team_url이 https://team.slack.com 형식
+        return f"{self.team_url}archives/{channel_id}/{ts_for_link}"
+
+    def get_channels_with_bot(self):
+        """봇이 참여한 채널 목록 가져오기 (전역 캐시 + TTL)"""
+        global _global_channel_cache
+
+        # 전역 캐시 확인
+        cache_key = self.token[:20]  # 토큰 일부를 키로 사용
+        if cache_key in _global_channel_cache:
+            cached = _global_channel_cache[cache_key]
+            # TTL 확인
+            if time.time() - cached["timestamp"] < CACHE_TTL:
+                return cached["data"]
+
+        try:
+            response = self.session.get(
+                "https://slack.com/api/users.conversations",
+                params={"types": "public_channel,private_channel"}
+            )
+            data = response.json()
+
+            if data.get("ok"):
+                channels = data.get("channels", [])
+                # 전역 캐시 저장
+                _global_channel_cache[cache_key] = {
+                    "data": channels,
+                    "timestamp": time.time()
+                }
+                return channels
+            else:
+                return []
+        except Exception as e:
+            print(f"채널 조회 오류: {e}")
+            return []
+
+    def get_channel_messages(self, channel_id, limit=50):
+        """특정 채널의 메시지 조회 (병렬 처리로 최적화)"""
+        try:
+            response = self.session.get(
+                "https://slack.com/api/conversations.history",
+                params={"channel": channel_id, "limit": limit}
+            )
+            data = response.json()
+
+            if data.get("ok"):
+                messages = data.get("messages", [])
+
+                if not messages:
+                    return []
+
+                # 사용자 정보 캐시
+                user_cache = {}
+                bot_cache = {}
+
+                # 필요한 모든 사용자 ID와 봇 ID 수집
+                user_ids = set()
+                bot_ids = set()
+                mention_user_ids = set()
+
+                for msg in messages:
+                    # 메시지 작성자
+                    if "user" in msg:
+                        user_ids.add(msg["user"])
+                    elif "bot_id" in msg:
+                        bot_ids.add(msg["bot_id"])
+
+                    # 멘션된 사용자
+                    if "text" in msg:
+                        mentions = self.mention_pattern.findall(msg["text"])
+                        mention_user_ids.update(mentions)
+
+                # 모든 사용자를 병렬로 조회
+                all_user_ids = user_ids | mention_user_ids
+                if all_user_ids:
+                    user_cache = self.get_user_info_batch(list(all_user_ids))
+
+                # 봇 정보 조회 (병렬)
+                if bot_ids:
+                    def fetch_bot(bid):
+                        return bid, self.get_bot_info(bid)
+
+                    futures = [executor.submit(fetch_bot, bid) for bid in bot_ids]
+                    for future in as_completed(futures):
+                        bid, info = future.result()
+                        bot_cache[bid] = info
+
+                # 메시지에 정보 추가
+                for msg in messages:
+                    # 메시지 텍스트에서 사용자 멘션 변환
+                    if "text" in msg:
+                        msg["text"] = self.replace_user_mentions(msg["text"], user_cache)
+
+                    if "user" in msg:
+                        user_id = msg["user"]
+                        user_info = user_cache.get(user_id, {})
+                        msg["user_name"] = self.get_display_name(user_info)
+                        msg["is_bot"] = user_info.get("is_bot", False)
+                    elif "bot_id" in msg:
+                        bot_id = msg["bot_id"]
+                        bot_info = bot_cache.get(bot_id, {})
+                        msg["user_name"] = bot_info.get("name", msg.get("username", "Bot"))
+                        msg["is_bot"] = True
+                    elif "username" in msg:
+                        msg["user_name"] = msg["username"]
+                        msg["is_bot"] = True
+                    else:
+                        msg["user_name"] = "Unknown"
+                        msg["is_bot"] = False
+
+                    # 스레드 정보 추가
+                    if msg.get("thread_ts"):
+                        msg["has_thread"] = True
+                        msg["reply_count"] = msg.get("reply_count", 0)
+                        msg["reply_users_count"] = msg.get("reply_users_count", 0)
+                    else:
+                        msg["has_thread"] = False
+
+                return messages
+            else:
+                return []
+        except Exception as e:
+            print(f"메시지 조회 오류: {e}")
+            return []
+
+    def get_user_info(self, user_id):
+        """사용자 정보 조회 (전역 캐시 + TTL)"""
+        global _global_user_cache
+
+        # 전역 캐시 확인
+        if user_id in _global_user_cache:
+            cached = _global_user_cache[user_id]
+            # TTL 확인
+            if time.time() - cached["timestamp"] < CACHE_TTL:
+                return cached["data"]
+
+        try:
+            response = self.session.get(
+                "https://slack.com/api/users.info",
+                params={"user": user_id}
+            )
+            data = response.json()
+
+            if data.get("ok"):
+                user_info = data.get("user", {})
+                # 전역 캐시 저장
+                _global_user_cache[user_id] = {
+                    "data": user_info,
+                    "timestamp": time.time()
+                }
+                return user_info
+            return {}
+        except Exception as e:
+            print(f"사용자 정보 조회 오류: {e}")
+            return {}
+
+    def get_user_id_by_username(self, username):
+        """username으로 user_id 조회 (캐싱 최적화)"""
+        global _global_users_list_cache
+
+        try:
+            # 전역 캐시 확인
+            cache_key = self.token[:20]
+            members = None
+
+            if cache_key in _global_users_list_cache:
+                cached = _global_users_list_cache[cache_key]
+                # TTL 확인
+                if time.time() - cached["timestamp"] < USERS_LIST_CACHE_TTL:
+                    members = cached["data"]
+
+            # 캐시 미스 시 API 호출
+            if members is None:
+                response = self.session.get("https://slack.com/api/users.list")
+                data = response.json()
+
+                if data.get("ok"):
+                    members = data.get("members", [])
+                    # 전역 캐시 저장
+                    _global_users_list_cache[cache_key] = {
+                        "data": members,
+                        "timestamp": time.time()
+                    }
+                else:
+                    return None
+
+            # username 매칭
+            for member in members:
+                if (member.get("name") == username or
+                    member.get("real_name") == username or
+                    member.get("profile", {}).get("display_name") == username):
+                    return member.get("id")
+
+            return None
+        except Exception as e:
+            print(f"username 조회 오류: {e}")
+            return None
+
+    def refresh_watched_user_ids(self):
+        """watched_users를 user_id로 변환하여 캐시"""
+        self.watched_user_ids = []
+        for username in self.watched_users:
+            user_id = self.get_user_id_by_username(username)
+            if user_id:
+                self.watched_user_ids.append(user_id)
+                print(f"✅ 감시 사용자 변환: {username} -> {user_id}")
+            else:
+                print(f"⚠️ 사용자 '{username}' 찾을 수 없음")
+
+    def get_bot_info(self, bot_id):
+        """봇 정보 조회 (전역 캐시 + TTL)"""
+        global _global_bot_cache
+
+        # 전역 캐시 확인
+        if bot_id in _global_bot_cache:
+            cached = _global_bot_cache[bot_id]
+            # TTL 확인
+            if time.time() - cached["timestamp"] < CACHE_TTL:
+                return cached["data"]
+
+        try:
+            response = self.session.get(
+                "https://slack.com/api/bots.info",
+                params={"bot": bot_id}
+            )
+            data = response.json()
+
+            if data.get("ok"):
+                bot_info = data.get("bot", {})
+                # 전역 캐시 저장
+                _global_bot_cache[bot_id] = {
+                    "data": bot_info,
+                    "timestamp": time.time()
+                }
+                return bot_info
+            return {}
+        except Exception as e:
+            print(f"봇 정보 조회 오류: {e}")
+            return {}
+
+    def get_display_name(self, user_info):
+        """사용자 정보에서 표시할 이름 추출 (닉네임 우선)"""
+        if not user_info:
+            return "Unknown"
+
+        # 1순위: profile.display_name (닉네임)
+        profile = user_info.get("profile", {})
+        display_name = profile.get("display_name", "").strip()
+        if display_name:
+            return display_name
+
+        # 2순위: real_name (실명)
+        real_name = user_info.get("real_name", "").strip()
+        if real_name:
+            return real_name
+
+        # 3순위: name (사용자 ID)
+        return user_info.get("name", "Unknown")
+
+    def replace_user_mentions(self, text, user_cache):
+        """메시지 텍스트에서 <@USER_ID> 형식을 실제 사용자 이름으로 변환 (최적화)"""
+        # 컴파일된 정규표현식 사용
+        mentions = self.mention_pattern.findall(text)
+
+        if not mentions:
+            return text
+
+        # 각 멘션을 실제 이름으로 변환
+        for user_id in mentions:
+            if user_id not in user_cache:
+                user_cache[user_id] = self.get_user_info(user_id)
+
+            user_info = user_cache[user_id]
+            user_name = self.get_display_name(user_info)
+
+            # <@USER_ID>를 @사용자이름으로 변환
+            text = text.replace(f'<@{user_id}>', f'@{user_name}')
+
+        return text
+
+    def get_user_info_batch(self, user_ids):
+        """여러 사용자 정보를 병렬로 조회"""
+        global _global_user_cache
+
+        results = {}
+        to_fetch = []
+
+        # 캐시에서 먼저 확인
+        for user_id in user_ids:
+            if user_id in _global_user_cache:
+                cached = _global_user_cache[user_id]
+                if time.time() - cached["timestamp"] < CACHE_TTL:
+                    results[user_id] = cached["data"]
+                    continue
+            to_fetch.append(user_id)
+
+        # 병렬로 나머지 조회
+        if to_fetch:
+            def fetch_user(uid):
+                return uid, self.get_user_info(uid)
+
+            futures = [executor.submit(fetch_user, uid) for uid in to_fetch]
+            for future in as_completed(futures):
+                uid, info = future.result()
+                results[uid] = info
+
+        return results
+
+    def get_thread_replies(self, channel_id, thread_ts):
+        """스레드 답글 조회"""
+        try:
+            response = self.session.get(
+                "https://slack.com/api/conversations.replies",
+                params={
+                    "channel": channel_id,
+                    "ts": thread_ts
+                }
+            )
+            data = response.json()
+
+            if data.get("ok"):
+                messages = data.get("messages", [])
+
+                if not messages:
+                    return []
+
+                # 첫 번째 메시지는 원본 메시지이므로 제외
+                thread_replies = messages[1:] if len(messages) > 1 else []
+
+                # 사용자 정보 캐시
+                user_cache = {}
+                bot_cache = {}
+
+                # 필요한 모든 사용자 ID와 봇 ID 수집
+                user_ids = set()
+                bot_ids = set()
+                mention_user_ids = set()
+
+                for msg in thread_replies:
+                    # 메시지 작성자
+                    if "user" in msg:
+                        user_ids.add(msg["user"])
+                    elif "bot_id" in msg:
+                        bot_ids.add(msg["bot_id"])
+
+                    # 멘션된 사용자
+                    if "text" in msg:
+                        mentions = self.mention_pattern.findall(msg["text"])
+                        mention_user_ids.update(mentions)
+
+                # 모든 사용자를 병렬로 조회
+                all_user_ids = user_ids | mention_user_ids
+                if all_user_ids:
+                    user_cache = self.get_user_info_batch(list(all_user_ids))
+
+                # 봇 정보 조회 (병렬)
+                if bot_ids:
+                    def fetch_bot(bid):
+                        return bid, self.get_bot_info(bid)
+
+                    futures = [executor.submit(fetch_bot, bid) for bid in bot_ids]
+                    for future in as_completed(futures):
+                        bid, info = future.result()
+                        bot_cache[bid] = info
+
+                # 메시지에 정보 추가
+                for msg in thread_replies:
+                    # 메시지 텍스트에서 사용자 멘션 변환
+                    if "text" in msg:
+                        msg["text"] = self.replace_user_mentions(msg["text"], user_cache)
+
+                    if "user" in msg:
+                        user_id = msg["user"]
+                        user_info = user_cache.get(user_id, {})
+                        msg["user_name"] = self.get_display_name(user_info)
+                        msg["is_bot"] = user_info.get("is_bot", False)
+                    elif "bot_id" in msg:
+                        bot_id = msg["bot_id"]
+                        bot_info = bot_cache.get(bot_id, {})
+                        msg["user_name"] = bot_info.get("name", msg.get("username", "Bot"))
+                        msg["is_bot"] = True
+                    elif "username" in msg:
+                        msg["user_name"] = msg["username"]
+                        msg["is_bot"] = True
+                    else:
+                        msg["user_name"] = "Unknown"
+                        msg["is_bot"] = False
+
+                return thread_replies
+            else:
+                return []
+        except Exception as e:
+            print(f"스레드 답글 조회 오류: {e}")
+            return []
+
+    def get_my_activity(self, limit=50):
+        """내 활동 메시지 조회 (멘션, 반응, 스레드, DM 등 모든 활동)"""
+        try:
+            all_activities = []
+            channels = self.get_channels_with_bot()
+
+            print(f"=== 내 활동 조회 시작: 총 {len(channels)}개 채널 검색 ===")
+
+            # 1. 각 채널에서 나와 관련된 활동 찾기
+            for channel in channels:
+                channel_id = channel["id"]
+                channel_name = channel["name"]
+                channel_type = "channel"
+
+                try:
+                    response = self.session.get(
+                        "https://slack.com/api/conversations.history",
+                        params={
+                            "channel": channel_id,
+                            "limit": 100  # 각 채널에서 최근 100개 확인
+                        }
+                    )
+                    data = response.json()
+
+                    if data.get("ok"):
+                        messages = data.get("messages", [])
+
+                        for msg in messages:
+                            text = msg.get("text", "")
+                            activity_type = None
+                            msg_user = msg.get("user")
+
+                            # 1) 나에 대한 직접 멘션
+                            if f'<@{self.bot_user_id}>' in text:
+                                activity_type = "mention"
+                                msg["activity_type"] = "멘션"
+                                msg["activity_icon"] = "💬"
+
+                            # 2) 내가 보낸 메시지에 대한 스레드 답글
+                            elif msg.get("thread_ts") and msg.get("thread_ts") != msg.get("ts"):
+                                # 스레드의 원본 메시지가 내가 작성한 것인지 확인
+                                thread_parent_ts = msg.get("thread_ts")
+                                # 원본 메시지 찾기
+                                parent_msg = next((m for m in messages if m.get("ts") == thread_parent_ts), None)
+                                # 원본 메시지가 내가 작성한 것이고, 답글은 다른 사람이 작성한 경우만 포함
+                                if parent_msg and parent_msg.get("user") == self.bot_user_id and msg_user != self.bot_user_id:
+                                    activity_type = "thread"
+                                    msg["activity_type"] = "스레드 답글"
+                                    msg["activity_icon"] = "💭"
+
+                            # 3) 내 메시지에 대한 반응 (내가 작성한 메시지만)
+                            elif msg.get("reactions") and msg_user == self.bot_user_id:
+                                activity_type = "reaction"
+                                reactions_text = ", ".join([f":{r['name']}:" for r in msg.get("reactions", [])])
+                                msg["activity_type"] = f"반응: {reactions_text}"
+                                msg["activity_icon"] = "❤️"
+
+                            # 4) @channel, @here 전체 멘션 (내가 보낸 것이 아닌 경우만)
+                            elif ("@channel" in text or "@here" in text) and msg_user != self.bot_user_id:
+                                activity_type = "broadcast"
+                                msg["activity_type"] = "전체 멘션"
+                                msg["activity_icon"] = "📢"
+
+                            if activity_type:
+                                msg["channel_id"] = channel_id
+                                msg["channel_name"] = channel_name
+                                msg["channel_type"] = channel_type
+                                all_activities.append(msg)
+
+                except Exception as e:
+                    print(f"채널 {channel_name} 조회 오류: {e}")
+                    continue
+
+            # 2. DM (Direct Message) 조회
+            try:
+                dm_response = self.session.get(
+                    "https://slack.com/api/conversations.list",
+                    params={
+                        "types": "im",  # Direct Message
+                        "limit": 100
+                    }
+                )
+                dm_data = dm_response.json()
+
+                if dm_data.get("ok"):
+                    dm_channels = dm_data.get("channels", [])
+                    print(f"=== {len(dm_channels)}개 DM 채널 검색 ===")
+
+                    for dm_channel in dm_channels[:10]:  # 최근 10개 DM만 확인
+                        dm_id = dm_channel["id"]
+
+                        try:
+                            dm_history = self.session.get(
+                                "https://slack.com/api/conversations.history",
+                                params={
+                                    "channel": dm_id,
+                                    "limit": 20
+                                }
+                            )
+                            dm_history_data = dm_history.json()
+
+                            if dm_history_data.get("ok"):
+                                dm_messages = dm_history_data.get("messages", [])
+
+                                for msg in dm_messages:
+                                    # 내가 받은 DM (상대방이 보낸 메시지)
+                                    if msg.get("user") != self.bot_user_id:
+                                        msg["channel_id"] = dm_id
+                                        msg["channel_name"] = "DM"
+                                        msg["channel_type"] = "dm"
+                                        msg["activity_type"] = "DM"
+                                        msg["activity_icon"] = "✉️"
+                                        all_activities.append(msg)
+                        except Exception as e:
+                            print(f"DM 조회 오류: {e}")
+                            continue
+
+            except Exception as e:
+                print(f"DM 목록 조회 오류: {e}")
+
+            print(f"=== 총 {len(all_activities)}개 활동 발견 ===")
+
+            # 타임스탬프로 정렬 (최신순)
+            all_activities.sort(key=lambda x: float(x.get('ts', 0)), reverse=True)
+
+            # limit 적용
+            messages = all_activities[:limit]
+
+            if not messages:
+                print("=== 멘션 메시지 없음 ===")
+                return []
+
+            # 사용자 정보 캐싱
+            user_cache = {}
+            bot_cache = {}
+
+            # 필요한 모든 사용자 ID와 봇 ID 수집
+            user_ids = set()
+            bot_ids = set()
+            mention_user_ids = set()
+
+            for msg in messages:
+                # 메시지 작성자
+                if "user" in msg:
+                    user_ids.add(msg["user"])
+                elif "bot_id" in msg:
+                    bot_ids.add(msg["bot_id"])
+
+                # 멘션된 사용자
+                if "text" in msg:
+                    mentions = self.mention_pattern.findall(msg["text"])
+                    mention_user_ids.update(mentions)
+
+            # 모든 사용자를 병렬로 조회
+            all_user_ids = user_ids | mention_user_ids
+            if all_user_ids:
+                user_cache = self.get_user_info_batch(list(all_user_ids))
+
+            # 봇 정보 조회 (병렬)
+            if bot_ids:
+                def fetch_bot(bid):
+                    return bid, self.get_bot_info(bid)
+
+                futures = [executor.submit(fetch_bot, bid) for bid in bot_ids]
+                for future in as_completed(futures):
+                    bid, info = future.result()
+                    bot_cache[bid] = info
+
+            # 메시지에 정보 추가
+            for msg in messages:
+                # 메시지 텍스트에서 사용자 멘션 변환
+                if "text" in msg:
+                    msg["text"] = self.replace_user_mentions(msg["text"], user_cache)
+
+                if "user" in msg:
+                    user_id = msg["user"]
+                    user_info = user_cache.get(user_id, {})
+                    msg["user_name"] = self.get_display_name(user_info)
+                    msg["is_bot"] = user_info.get("is_bot", False)
+                elif "bot_id" in msg:
+                    bot_id = msg["bot_id"]
+                    bot_info = bot_cache.get(bot_id, {})
+                    msg["user_name"] = bot_info.get("name", msg.get("username", "Bot"))
+                    msg["is_bot"] = True
+                elif "username" in msg:
+                    msg["user_name"] = msg["username"]
+                    msg["is_bot"] = True
+                else:
+                    msg["user_name"] = "Unknown"
+                    msg["is_bot"] = False
+
+            print(f"=== {len(messages)}개 메시지 반환 ===")
+            return messages
+        except Exception as e:
+            print(f"내 활동 조회 오류: {e}")
+            return []
+
+    def get_usergroup_handle(self, subteam_id):
+        """User Group ID로 handle 조회 (캐싱 적용)"""
+        current_time = time.time()
+
+        # 캐시가 유효하고 해당 ID가 캐시에 있으면 반환
+        if (current_time - self._usergroups_cache_time < self._usergroups_cache_ttl and
+            subteam_id in self._usergroups_cache):
+            return self._usergroups_cache[subteam_id]
+
+        # 캐시가 만료되었거나 없으면 전체 목록 새로 조회
+        if current_time - self._usergroups_cache_time >= self._usergroups_cache_ttl:
+            try:
+                list_response = self.session.get(
+                    "https://slack.com/api/usergroups.list",
+                    params={"include_users": False}
+                )
+                list_data = list_response.json()
+                if list_data.get("ok"):
+                    # 전체 캐시 갱신
+                    self._usergroups_cache = {
+                        ug.get("id"): ug.get("handle", "그룹")
+                        for ug in list_data.get("usergroups", [])
+                    }
+                    self._usergroups_cache_time = current_time
+            except Exception as e:
+                print(f"❌ User Group 목록 조회 실패: {e}")
+
+        # 캐시에서 반환 (없으면 기본값)
+        return self._usergroups_cache.get(subteam_id, "그룹")
+
+    def get_usergroup_members(self, subteam_id):
+        """User Group ID로 멤버 리스트 조회 (캐싱 적용)"""
+        current_time = time.time()
+
+        # 캐시가 유효하고 해당 ID가 캐시에 있으면 반환
+        if (subteam_id in self._usergroup_members_cache_time and
+            current_time - self._usergroup_members_cache_time[subteam_id] < self._usergroup_members_cache_ttl):
+            return self._usergroup_members_cache.get(subteam_id, [])
+
+        # 캐시가 없거나 만료되면 API 호출
+        try:
+            response = self.session.get(
+                "https://slack.com/api/usergroups.users.list",
+                params={"usergroup": subteam_id}
+            )
+            data = response.json()
+            if data.get("ok"):
+                members = data.get("users", [])
+                # 캐시 저장
+                self._usergroup_members_cache[subteam_id] = members
+                self._usergroup_members_cache_time[subteam_id] = current_time
+                return members
+        except Exception as e:
+            print(f"❌ 그룹 멤버 조회 실패: {e}")
+
+        # 실패 시 빈 리스트 반환
+        return []
+
+    def check_new_mentions(self, since_timestamp):
+        """새로운 멘션 확인 (병렬 처리 최적화)"""
+        notifications = []
+        channels = self.get_channels_with_bot()
+        max_timestamp = since_timestamp  # 처리한 메시지 중 가장 최신 timestamp 추적
+
+        # 채널 병렬 처리 함수
+        def check_channel(channel):
+            channel_notifications = []
+            local_max_ts = since_timestamp
+            channel_id = channel["id"]
+            channel_name = channel["name"]
+
+            try:
+                response = self.session.get(
+                    "https://slack.com/api/conversations.history",
+                    params={
+                        "channel": channel_id,
+                        "oldest": str(since_timestamp),
+                        "limit": 100
+                    }
+                )
+                data = response.json()
+
+                if data.get("ok"):
+                    messages = data.get("messages", [])
+
+                    for msg in messages:
+                        text = msg.get("text", "")
+                        user_id = msg.get("user", "")
+                        bot_id = msg.get("bot_id", "")
+                        ts = float(msg.get("ts", 0))
+
+                        # 자신의 메시지는 제외
+                        if user_id == self.bot_user_id:
+                            continue
+
+                        is_notification = False
+                        notification_reason = ""
+
+                        # 1. 봇 멘션 확인
+                        if f'<@{self.bot_user_id}>' in text:
+                            is_notification = True
+                            notification_reason = "봇 멘션"
+
+                        # 2. @channel, @here 확인
+                        elif '@here' in text or '@channel' in text or '<!channel' in text or '<!here' in text:
+                            is_notification = True
+                            notification_reason = "@here/@channel"
+
+                        # 3. User Group 멘션 확인 (<!subteam^ID> 또는 <!subteam^ID|@groupname> 형식)
+                        elif '<!subteam^' in text:
+                            # 두 가지 패턴 모두 지원: <!subteam^ID> 또는 <!subteam^ID|@groupname>
+                            subteam_pattern = re.compile(r'<!subteam\^([A-Z0-9]+)(?:\|@([^>]+))?>')
+                            matches = subteam_pattern.findall(text)
+                            for match in matches:
+                                subteam_id = match[0]
+                                # 메시지에 포함된 이름이 있으면 사용, 없으면 캐시에서 조회
+                                group_name = match[1] if match[1] else self.get_usergroup_handle(subteam_id)
+
+                                # User Group 멤버 확인 (캐싱 사용)
+                                members = self.get_usergroup_members(subteam_id)
+                                # 감시 중인 사용자가 그룹에 속해있는지 확인
+                                for watched_user_id in self.watched_user_ids:
+                                    if watched_user_id in members:
+                                        is_notification = True
+                                        notification_reason = f"그룹 멘션 (@{group_name})"
+                                        break
+                                if is_notification:
+                                    break
+
+                        # 4. 등록된 사용자 멘션 확인
+                        if not is_notification:
+                            for watched_user_id in self.watched_user_ids:
+                                if f'<@{watched_user_id}>' in text:
+                                    is_notification = True
+                                    notification_reason = f"사용자 멘션"
+                                    break
+
+                        if is_notification:
+                            # 사용자 또는 봇 정보 가져오기
+                            if user_id:
+                                user_info = self.get_user_info(user_id)
+                                display_name = self.get_display_name(user_info)
+                            elif bot_id:
+                                bot_info = self.get_bot_info(bot_id)
+                                display_name = bot_info.get("name", msg.get("username", "Bot"))
+                            else:
+                                display_name = msg.get("username", "Unknown")
+
+                            # 텍스트에서 사용자 멘션을 실제 이름으로 변환
+                            user_cache = {}
+                            display_text = self.replace_user_mentions(text, user_cache)
+
+                            # 메시지 링크 생성
+                            message_link = self.get_message_link(channel_id, str(ts))
+
+                            channel_notifications.append({
+                                "channel": channel_name,
+                                "channel_id": channel_id,
+                                "user": display_name,
+                                "text": display_text,
+                                "timestamp": ts,
+                                "reason": notification_reason,
+                                "time": datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S"),
+                                "message_link": message_link
+                            })
+
+                        # 메시지 timestamp 추적
+                        if ts > local_max_ts:
+                            local_max_ts = ts
+
+            except Exception as e:
+                pass  # 에러는 무시 (로그 감소)
+
+            return channel_notifications, local_max_ts
+
+        # 채널들을 병렬로 처리
+        futures = [executor.submit(check_channel, ch) for ch in channels]
+        for future in as_completed(futures):
+            channel_notifs, local_max = future.result()
+            notifications.extend(channel_notifs)
+            if local_max > max_timestamp:
+                max_timestamp = local_max
+
+        # 4. DM (Direct Message) 확인
+        try:
+            dm_response = self.session.get(
+                "https://slack.com/api/conversations.list",
+                params={
+                    "types": "im",  # Direct Message
+                    "limit": 100
+                }
+            )
+            dm_data = dm_response.json()
+
+            if dm_data.get("ok"):
+                dm_channels = dm_data.get("channels", [])
+
+                for dm_channel in dm_channels:
+                    dm_id = dm_channel["id"]
+
+                    try:
+                        dm_history = self.session.get(
+                            "https://slack.com/api/conversations.history",
+                            params={
+                                "channel": dm_id,
+                                "oldest": str(since_timestamp),
+                                "limit": 50
+                            }
+                        )
+                        dm_history_data = dm_history.json()
+
+                        if dm_history_data.get("ok"):
+                            dm_messages = dm_history_data.get("messages", [])
+
+                            for msg in dm_messages:
+                                # 내가 받은 DM (상대방이 보낸 메시지)
+                                if msg.get("user") != self.bot_user_id:
+                                    user_id = msg.get("user", "")
+                                    text = msg.get("text", "")
+                                    ts = float(msg.get("ts", 0))
+
+                                    user_info = self.get_user_info(user_id)
+                                    display_name = self.get_display_name(user_info)
+
+                                    # 텍스트에서 사용자 멘션을 실제 이름으로 변환
+                                    user_cache = {}
+                                    display_text = self.replace_user_mentions(text, user_cache)
+
+                                    # 메시지 링크 생성
+                                    message_link = self.get_message_link(dm_id, str(ts))
+
+                                    notifications.append({
+                                        "channel": f"DM from {display_name}",
+                                        "channel_id": dm_id,
+                                        "user": display_name,
+                                        "text": display_text,
+                                        "timestamp": ts,
+                                        "reason": "DM",
+                                        "time": datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S"),
+                                        "message_link": message_link
+                                    })
+
+                                    # 메시지 timestamp 추적
+                                    if ts > max_timestamp:
+                                        max_timestamp = ts
+                    except Exception as e:
+                        print(f"DM 확인 오류: {e}")
+                        continue
+
+        except Exception as e:
+            print(f"DM 목록 조회 오류: {e}")
+
+        return notifications, max_timestamp
+
+
+# Flask 라우트
+@app.route('/')
+def index():
+    """메인 페이지"""
+    return render_template('index.html')
+
+
+@app.route('/api/connect', methods=['POST'])
+def connect():
+    """Slack 연결"""
+    data = request.json
+    token = data.get('token', '')
+
+    if not token:
+        return jsonify({"success": False, "error": "토큰이 필요합니다"})
+
+    notifier = SlackNotifier(token)
+    result = notifier.test_connection()
+
+    if result["success"]:
+        # 세션에 토큰과 notifier 정보 저장
+        session['token'] = token
+        session['bot_id'] = result['bot_id']
+        session['team_url'] = result.get('team_url', '')
+        session_id = session.sid if hasattr(session, 'sid') else str(time.time())
+
+        # 사용자별 초기화
+        if session_id not in monitoring_active:
+            monitoring_active[session_id] = False
+            last_check_times[session_id] = time.time()
+            notification_queues[session_id] = []
+
+    return jsonify(result)
+
+
+@app.route('/api/channels', methods=['GET'])
+def get_channels():
+    """채널 목록 조회"""
+    token = session.get('token')
+    if not token:
+        return jsonify({"success": False, "error": "연결되지 않음"})
+
+    notifier = SlackNotifier(token)
+    notifier.bot_user_id = session.get('bot_id')
+    channels = notifier.get_channels_with_bot()
+
+    # 디버그 로그
+    print(f"=== 채널 목록 조회 ===")
+    print(f"총 {len(channels)}개 채널 발견:")
+    for ch in channels:
+        print(f"  - {ch['name']} (ID: {ch['id']})")
+    print("=" * 50)
+
+    return jsonify({
+        "success": True,
+        "channels": [{"id": ch["id"], "name": ch["name"]} for ch in channels]
+    })
+
+
+@app.route('/api/debug/channels', methods=['GET'])
+def debug_channels():
+    """모든 채널 조회 (디버그용)"""
+    token = session.get('token')
+    if not token:
+        return jsonify({"success": False, "error": "연결되지 않음"})
+
+    try:
+        # 모든 public 채널 조회
+        response = requests.get(
+            "https://slack.com/api/conversations.list",
+            headers={"Authorization": f"Bearer {token}"},
+            params={
+                "types": "public_channel,private_channel",
+                "exclude_archived": True,
+                "limit": 200
+            }
+        )
+        data = response.json()
+
+        if data.get("ok"):
+            all_channels = data.get("channels", [])
+            bot_id = session.get('bot_id')
+
+            result = {
+                "success": True,
+                "total_channels": len(all_channels),
+                "bot_id": bot_id,
+                "channels": []
+            }
+
+            for ch in all_channels:
+                channel_info = {
+                    "id": ch["id"],
+                    "name": ch["name"],
+                    "is_member": ch.get("is_member", False),
+                    "is_private": ch.get("is_private", False),
+                    "num_members": ch.get("num_members", 0)
+                }
+                result["channels"].append(channel_info)
+
+            return jsonify(result)
+        else:
+            return jsonify({"success": False, "error": data.get("error", "Unknown")})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+
+@app.route('/api/messages/<channel_id>', methods=['GET'])
+def get_messages(channel_id):
+    """채널 메시지 조회"""
+    token = session.get('token')
+    limit = request.args.get('limit', 50, type=int)
+
+    if not token:
+        return jsonify({"success": False, "error": "연결되지 않음"})
+
+    notifier = SlackNotifier(token)
+    messages = notifier.get_channel_messages(channel_id, limit)
+
+    return jsonify({
+        "success": True,
+        "messages": messages
+    })
+
+
+@app.route('/api/my-activity', methods=['GET'])
+def get_my_activity():
+    """내 활동 메시지 조회 (나에게 온 멘션 등)"""
+    token = session.get('token')
+    bot_id = session.get('bot_id')
+    limit = request.args.get('limit', 50, type=int)
+
+    if not token:
+        return jsonify({"success": False, "error": "연결되지 않음"})
+
+    notifier = SlackNotifier(token)
+    notifier.bot_user_id = bot_id
+    messages = notifier.get_my_activity(limit)
+
+    return jsonify({
+        "success": True,
+        "messages": messages
+    })
+
+
+@app.route('/api/monitoring/start', methods=['POST'])
+def start_monitoring():
+    """실시간 모니터링 시작"""
+    session_id = request.json.get('session_id', str(time.time()))
+
+    if session_id not in monitoring_active:
+        monitoring_active[session_id] = False
+        last_check_times[session_id] = time.time()
+        notification_queues[session_id] = []
+
+    monitoring_active[session_id] = True
+    last_check_times[session_id] = time.time()
+
+    return jsonify({"success": True, "message": "모니터링 시작됨"})
+
+
+@app.route('/api/monitoring/stop', methods=['POST'])
+def stop_monitoring():
+    """실시간 모니터링 중지"""
+    session_id = request.json.get('session_id', str(time.time()))
+
+    if session_id in monitoring_active:
+        monitoring_active[session_id] = False
+
+    return jsonify({"success": True, "message": "모니터링 중지됨"})
+
+
+@app.route('/api/monitoring/test', methods=['POST'])
+def test_notification():
+    """테스트 알림 생성"""
+    session_id = request.json.get('session_id', str(time.time()))
+
+    # 더미 알림 데이터 생성
+    test_notifications = [
+        {
+            "channel": "테스트-채널",
+            "channel_id": "C123456",
+            "user": "테스트사용자",
+            "text": "@당신 테스트 멘션입니다! 실시간 알림이 잘 작동하는지 확인하는 메시지입니다.",
+            "timestamp": time.time(),
+            "reason": "봇 멘션",
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        },
+        {
+            "channel": "일반-채널",
+            "channel_id": "C789012",
+            "user": "김철수",
+            "text": "@channel 전체 공지사항입니다.",
+            "timestamp": time.time(),
+            "reason": "@here/@channel",
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        },
+        {
+            "channel": "DM from 이영희",
+            "channel_id": "D345678",
+            "user": "이영희",
+            "text": "안녕하세요! DM 테스트 메시지입니다.",
+            "timestamp": time.time(),
+            "reason": "DM",
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+    ]
+
+    # 세션의 알림 큐에 추가
+    if session_id not in notification_queues:
+        notification_queues[session_id] = []
+
+    notification_queues[session_id].extend(test_notifications)
+
+    return jsonify({"success": True, "message": f"{len(test_notifications)}개의 테스트 알림 생성됨"})
+
+
+@app.route('/api/monitoring/events')
+def monitoring_events():
+    """Server-Sent Events를 통한 실시간 알림"""
+    # request 컨텍스트에서 미리 값을 추출
+    session_id = request.args.get('session_id', str(time.time()))
+    token = session.get('token')
+    bot_id = session.get('bot_id')
+    team_url = session.get('team_url', '')
+
+    print(f"=== /api/monitoring/events 요청됨 (session_id={session_id}) ===")
+
+    def generate():
+        # 클로저로 session_id, token, bot_id, team_url 사용
+
+        if not token:
+            yield f"data: {json.dumps({'error': '연결되지 않음'})}\n\n"
+            return
+
+        notifier = SlackNotifier(token)
+        notifier.bot_user_id = bot_id
+        notifier.team_url = team_url
+
+        # watched_users 로드
+        watched_users_file = 'watched_users.json'
+        if os.path.exists(watched_users_file):
+            try:
+                with open(watched_users_file, 'r', encoding='utf-8') as f:
+                    notifier.watched_users = json.load(f)
+            except:
+                notifier.watched_users = []
+
+        # watched_users를 user_id로 변환 (초기화 시 한 번만)
+        notifier.refresh_watched_user_ids()
+
+        # 감시 사용자 목록 리로드 타이머
+        last_reload_time = time.time()
+        reload_interval = 5  # 5초마다 watched_users.json 다시 읽기
+
+        while True:
+            if session_id in monitoring_active and monitoring_active[session_id]:
+                # 0. 주기적으로 watched_users.json 리로드
+                current_time = time.time()
+                if current_time - last_reload_time >= reload_interval:
+                    try:
+                        with open(watched_users_file, 'r', encoding='utf-8') as f:
+                            new_watched_users = json.load(f)
+                        # 변경 사항이 있으면 리로드
+                        if new_watched_users != notifier.watched_users:
+                            notifier.watched_users = new_watched_users
+                            notifier.refresh_watched_user_ids()
+                            print(f"🔄 감시 사용자 목록 리로드됨: {notifier.watched_users}")
+                        last_reload_time = current_time
+                    except Exception as e:
+                        print(f"⚠️ watched_users.json 리로드 실패: {e}")
+
+                # 1. 큐에 있는 테스트 알림 먼저 전송
+                if session_id in notification_queues and notification_queues[session_id]:
+                    queued_notifications = notification_queues[session_id][:]
+                    notification_queues[session_id] = []
+                    for notif in queued_notifications:
+                        yield f"data: {json.dumps(notif)}\n\n"
+
+                # 2. 실제 Slack 알림 확인
+                since = last_check_times.get(session_id, time.time())
+                notifications, max_timestamp = notifier.check_new_mentions(since)
+
+                if notifications:
+                    for notif in notifications:
+                        yield f"data: {json.dumps(notif)}\n\n"
+
+                # 가장 최신 메시지 timestamp로 업데이트 (time.time() 대신)
+                last_check_times[session_id] = max_timestamp
+
+            time.sleep(2)  # 2초마다 체크 (성능 최적화)
+
+    return Response(generate(), mimetype='text/event-stream')
+
+
+@app.route('/api/channel/stream/<channel_id>')
+def channel_stream(channel_id):
+    """채널 메시지 실시간 스트리밍"""
+    token = session.get('token')
+    bot_id = session.get('bot_id')
+
+    print(f"=== 채널 스트리밍 요청: {channel_id} ===")
+
+    def generate():
+        if not token:
+            print("토큰 없음!")
+            yield f"data: {json.dumps({'error': '연결되지 않음'})}\n\n"
+            return
+
+        notifier = SlackNotifier(token)
+        notifier.bot_user_id = bot_id
+
+        # 초기 타임스탬프 설정 (현재 시간)
+        last_ts = time.time()
+
+        print(f"채널 스트리밍 루프 시작: {channel_id}, last_ts={last_ts}")
+
+        while True:
+            try:
+                # 최신 메시지 조회
+                messages = notifier.get_channel_messages(channel_id, limit=10)
+
+                if messages:
+                    # 새로운 메시지만 전송
+                    new_messages = [msg for msg in messages if float(msg.get('ts', 0)) > last_ts]
+
+                    if new_messages:
+                        print(f">>> 새 메시지 {len(new_messages)}개 발견!")
+                        # 타임스탬프 업데이트
+                        last_ts = max(float(msg.get('ts', 0)) for msg in messages)
+
+                        # 새 메시지 전송 (최신순)
+                        for msg in new_messages:
+                            print(f"메시지 전송: {msg.get('text', '')[:30]}...")
+                            yield f"data: {json.dumps(msg, ensure_ascii=False)}\n\n"
+
+                time.sleep(3)  # 3초마다 체크
+
+            except Exception as e:
+                print(f"!!! 채널 스트림 오류: {e}")
+                import traceback
+                traceback.print_exc()
+                time.sleep(5)
+
+    return Response(generate(), mimetype='text/event-stream', headers={
+        'Cache-Control': 'no-cache',
+        'X-Accel-Buffering': 'no',
+        'Connection': 'keep-alive'
+    })
+
+
+@app.route('/api/users/watched', methods=['GET'])
+def get_watched_users():
+    """모니터링 사용자 목록 조회"""
+    watched_users_file = 'watched_users.json'
+
+    if os.path.exists(watched_users_file):
+        try:
+            with open(watched_users_file, 'r', encoding='utf-8') as f:
+                users = json.load(f)
+                return jsonify({"success": True, "users": users})
+        except:
+            return jsonify({"success": True, "users": []})
+
+    return jsonify({"success": True, "users": []})
+
+
+@app.route('/api/users/watched', methods=['POST'])
+def add_watched_user():
+    """모니터링 사용자 추가"""
+    data = request.json
+    user = data.get('user', '').strip()
+
+    if not user:
+        return jsonify({"success": False, "error": "사용자 이름이 필요합니다"})
+
+    watched_users_file = 'watched_users.json'
+    users = []
+
+    if os.path.exists(watched_users_file):
+        try:
+            with open(watched_users_file, 'r', encoding='utf-8') as f:
+                users = json.load(f)
+        except:
+            users = []
+
+    if user not in users:
+        users.append(user)
+        with open(watched_users_file, 'w', encoding='utf-8') as f:
+            json.dump(users, f, ensure_ascii=False, indent=2)
+
+        return jsonify({"success": True, "users": users})
+
+    return jsonify({"success": False, "error": "이미 추가된 사용자입니다"})
+
+
+@app.route('/api/users/watched/<user>', methods=['DELETE'])
+def remove_watched_user(user):
+    """모니터링 사용자 제거"""
+    watched_users_file = 'watched_users.json'
+    users = []
+
+    if os.path.exists(watched_users_file):
+        try:
+            with open(watched_users_file, 'r', encoding='utf-8') as f:
+                users = json.load(f)
+        except:
+            users = []
+
+    if user in users:
+        users.remove(user)
+        with open(watched_users_file, 'w', encoding='utf-8') as f:
+            json.dump(users, f, ensure_ascii=False, indent=2)
+
+        return jsonify({"success": True, "users": users})
+
+    return jsonify({"success": False, "error": "사용자를 찾을 수 없습니다"})
+
+
+@app.route('/api/thread/<channel_id>/<thread_ts>', methods=['GET'])
+def get_thread(channel_id, thread_ts):
+    """스레드 답글 조회"""
+    token = session.get('token')
+
+    if not token:
+        return jsonify({"success": False, "error": "연결되지 않음"})
+
+    notifier = SlackNotifier(token)
+    notifier.bot_user_id = session.get('bot_id')
+    replies = notifier.get_thread_replies(channel_id, thread_ts)
+
+    return jsonify({
+        "success": True,
+        "replies": replies
+    })
+
+
+if __name__ == '__main__':
+    # watched_users.json 파일이 없으면 생성
+    if not os.path.exists('watched_users.json'):
+        with open('watched_users.json', 'w', encoding='utf-8') as f:
+            json.dump([], f)
+
+    print("=" * 60)
+    print("🌐 Slack 알림 모니터링 웹 서버 시작")
+    print("=" * 60)
+    print("📍 URL: http://localhost:5001")
+    print("🔄 브라우저에서 위 주소로 접속하세요")
+    print("=" * 60)
+
+    app.run(debug=True, host='0.0.0.0', port=5001, threaded=True, use_reloader=False)

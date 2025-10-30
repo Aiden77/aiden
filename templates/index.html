@@ -1,0 +1,1824 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Slack 알림 모니터링</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background: #f8f9fa;
+            color: #333;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        h1 {
+            text-align: center;
+            color: #2c3e50;
+            margin-bottom: 30px;
+            font-size: 28px;
+        }
+
+        .card {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+
+        .card h2 {
+            font-size: 18px;
+            margin-bottom: 15px;
+            color: #2c3e50;
+            border-bottom: 2px solid #3498db;
+            padding-bottom: 8px;
+        }
+
+        .connection-section {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        input[type="text"], input[type="password"] {
+            flex: 1;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+
+        button {
+            padding: 10px 20px;
+            background: #3498db;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: background 0.3s;
+        }
+
+        button:hover {
+            background: #2980b9;
+        }
+
+        button:disabled {
+            background: #bdc3c7;
+            cursor: not-allowed;
+        }
+
+        button.success {
+            background: #27ae60;
+        }
+
+        button.success:hover {
+            background: #229954;
+        }
+
+        button.danger {
+            background: #e74c3c;
+        }
+
+        button.danger:hover {
+            background: #c0392b;
+        }
+
+        button.warning {
+            background: #f39c12;
+        }
+
+        button.warning:hover {
+            background: #d68910;
+        }
+
+        .status {
+            display: inline-block;
+            padding: 5px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+            margin-left: 10px;
+        }
+
+        .status.connected {
+            background: #d4edda;
+            color: #155724;
+        }
+
+        .status.disconnected {
+            background: #f8d7da;
+            color: #721c24;
+        }
+
+        .status.monitoring {
+            background: #d1ecf1;
+            color: #0c5460;
+        }
+
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            border-bottom: 2px solid #e0e0e0;
+        }
+
+        .tab {
+            padding: 10px 20px;
+            background: transparent;
+            border: none;
+            border-bottom: 3px solid transparent;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            color: #666;
+            transition: all 0.3s;
+        }
+
+        .tab.active {
+            color: #3498db;
+            border-bottom-color: #3498db;
+        }
+
+        .tab-content {
+            display: none;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        .notification-item {
+            background: #fff3cd;
+            border-left: 4px solid #ffc107;
+            padding: 15px;
+            margin-bottom: 10px;
+            border-radius: 4px;
+            animation: slideIn 0.3s ease-out;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+
+        .notification-item.priority-critical {
+            background: #ffe5e5;
+            border-left-color: #ff4444;
+        }
+
+        .notification-item.priority-high {
+            background: #fff4e5;
+            border-left-color: #ff9500;
+        }
+
+        .notification-item.priority-normal {
+            background: #e8f4f8;
+            border-left-color: #4facfe;
+        }
+
+        .notification-item.priority-low {
+            background: #f5f5f5;
+            border-left-color: #a8dadc;
+        }
+
+        .notification-item.read {
+            background: white;
+            border-left-color: #ddd;
+            opacity: 0.7;
+        }
+
+        .notification-item:hover {
+            box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+        }
+
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(-10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .notification-item.new {
+            animation: blink 1s ease-in-out 3;
+        }
+
+        @keyframes blink {
+            0%, 100% { background: #fff3cd; }
+            50% { background: #ffe69c; }
+        }
+
+        .notification-item .time {
+            font-size: 12px;
+            color: #666;
+            margin-bottom: 5px;
+        }
+
+        .notification-item .channel {
+            font-weight: 600;
+            color: #3498db;
+            margin-bottom: 5px;
+        }
+
+        .notification-item .reason {
+            display: inline-block;
+            padding: 2px 8px;
+            background: #e74c3c;
+            color: white;
+            border-radius: 3px;
+            font-size: 11px;
+            margin-bottom: 5px;
+        }
+
+        .priority-badge {
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 12px;
+            font-size: 11px;
+            font-weight: 600;
+            margin-left: 8px;
+            text-transform: uppercase;
+        }
+
+        .priority-badge.critical {
+            background: linear-gradient(135deg, #ff4444 0%, #cc0000 100%);
+            color: white;
+            box-shadow: 0 2px 8px rgba(255, 68, 68, 0.4);
+            animation: pulse 2s ease-in-out infinite;
+        }
+
+        .priority-badge.high {
+            background: linear-gradient(135deg, #ff9500 0%, #ff5e00 100%);
+            color: white;
+            box-shadow: 0 2px 6px rgba(255, 149, 0, 0.3);
+        }
+
+        .priority-badge.normal {
+            background: linear-gradient(135deg, #4facfe 0%, #00b4d8 100%);
+            color: white;
+        }
+
+        .priority-badge.low {
+            background: linear-gradient(135deg, #a8dadc 0%, #6c757d 100%);
+            color: white;
+        }
+
+        @keyframes pulse {
+            0%, 100% {
+                transform: scale(1);
+                box-shadow: 0 2px 8px rgba(255, 68, 68, 0.4);
+            }
+            50% {
+                transform: scale(1.05);
+                box-shadow: 0 4px 12px rgba(255, 68, 68, 0.6);
+            }
+        }
+
+        .priority-reason {
+            display: block;
+            font-size: 11px;
+            color: #666;
+            margin-top: 4px;
+            font-style: italic;
+        }
+
+        .notification-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 5px;
+        }
+
+        .notification-link-btn {
+            padding: 4px 10px;
+            background: #3498db;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            font-size: 11px;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            transition: background 0.2s;
+            flex-shrink: 0;
+        }
+
+        .notification-link-btn:hover {
+            background: #2980b9;
+        }
+
+        .notification-item .text {
+            color: #333;
+            line-height: 1.5;
+        }
+
+        .message-item {
+            padding: 12px;
+            border-bottom: 1px solid #e0e0e0;
+            transition: background-color 0.5s ease;
+        }
+
+        .message-item:last-child {
+            border-bottom: none;
+        }
+
+        .message-item .user {
+            font-weight: 600;
+            color: #2c3e50;
+        }
+
+        .message-item .user.bot {
+            color: #9b59b6;
+        }
+
+        .message-item .time {
+            font-size: 11px;
+            color: #999;
+            margin-left: 8px;
+        }
+
+        .message-item .text {
+            margin-top: 5px;
+            color: #555;
+            line-height: 1.5;
+        }
+
+        .thread-indicator {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            margin-left: 10px;
+            padding: 2px 8px;
+            background: #f0f0f0;
+            border-radius: 10px;
+            font-size: 11px;
+            color: #666;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .thread-indicator:hover {
+            background: #e0e0e0;
+        }
+
+        .thread-replies {
+            margin-left: 30px;
+            margin-top: 10px;
+            padding-left: 15px;
+            border-left: 3px solid #3498db;
+            display: none;
+        }
+
+        .thread-replies.expanded {
+            display: block;
+        }
+
+        .thread-reply {
+            padding: 8px 0;
+            border-bottom: 1px solid #f0f0f0;
+        }
+
+        .thread-reply:last-child {
+            border-bottom: none;
+        }
+
+        .thread-loading {
+            padding: 10px;
+            text-align: center;
+            color: #999;
+            font-size: 12px;
+        }
+
+        .user-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 10px;
+        }
+
+        .user-tag {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 12px;
+            background: #e8f4f8;
+            border: 1px solid #3498db;
+            border-radius: 20px;
+            font-size: 13px;
+            color: #2c3e50;
+        }
+
+        .user-tag button {
+            padding: 0;
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            background: #e74c3c;
+            font-size: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .add-user-section {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+
+        select {
+            flex: 1;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 40px 20px;
+            color: #999;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 20px;
+            color: #666;
+        }
+
+        .message-controls {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+
+        .notification-count {
+            text-align: center;
+            font-size: 14px;
+            color: #666;
+            margin-bottom: 15px;
+        }
+
+        .notification-section {
+            margin-bottom: 25px;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+        }
+
+        .notification-section .section-header {
+            padding: 12px 20px;
+            font-weight: 600;
+            color: white;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .notification-section .section-header h3 {
+            margin: 0;
+            font-size: 16px;
+            font-weight: 600;
+        }
+
+        .new-section .section-header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+
+        .unread-section .section-header {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+        }
+
+        .read-section .section-header {
+            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+        }
+
+        .notification-section .section-content {
+            background: white;
+            padding: 10px;
+        }
+
+        .notification-section .notification-item {
+            margin-bottom: 8px;
+            border-radius: 6px;
+        }
+
+        .notification-section .notification-item:last-child {
+            margin-bottom: 0;
+        }
+
+        .new-section .notification-item {
+            border-left-color: #667eea;
+            box-shadow: 0 2px 6px rgba(102, 126, 234, 0.2);
+        }
+
+        .unread-section .notification-item {
+            border-left-color: #f5576c;
+        }
+
+        .read-section .notification-item {
+            border-left-color: #4facfe;
+            opacity: 0.85;
+        }
+
+        .sound-toggle {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-top: 10px;
+        }
+
+        .sound-toggle input[type="checkbox"] {
+            width: 20px;
+            height: 20px;
+        }
+
+        .notification-memo {
+            margin-top: 10px;
+            padding-top: 10px;
+            border-top: 1px solid #ddd;
+            display: none;
+        }
+
+        .notification-memo.show {
+            display: block;
+        }
+
+        .notification-memo textarea {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 13px;
+            resize: vertical;
+            min-height: 60px;
+            font-family: inherit;
+        }
+
+        .notification-memo .memo-buttons {
+            display: flex;
+            gap: 8px;
+            margin-top: 8px;
+        }
+
+        .notification-memo button {
+            padding: 6px 12px;
+            font-size: 12px;
+        }
+
+        .saved-memo {
+            margin-top: 10px;
+            padding: 8px 12px;
+            background: #f0f8ff;
+            border-left: 3px solid #3498db;
+            border-radius: 4px;
+            font-size: 13px;
+            color: #555;
+            display: none;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .saved-memo:hover {
+            background: #e0f0ff;
+        }
+
+        .saved-memo.show {
+            display: block;
+        }
+
+        .saved-memo .memo-label {
+            font-weight: 600;
+            color: #3498db;
+            margin-bottom: 4px;
+            font-size: 11px;
+        }
+
+        .saved-memo.editing {
+            padding: 0;
+            background: transparent;
+            border: none;
+        }
+
+        .saved-memo.editing:hover {
+            background: transparent;
+        }
+
+        .saved-memo .memo-edit-area {
+            display: none;
+        }
+
+        .saved-memo.editing .memo-edit-area {
+            display: block;
+        }
+
+        .saved-memo.editing .memo-content {
+            display: none;
+        }
+
+        .saved-memo.editing .memo-label {
+            display: none;
+        }
+
+        .saved-memo .memo-edit-textarea {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #3498db;
+            border-radius: 4px;
+            font-size: 13px;
+            resize: vertical;
+            min-height: 60px;
+            font-family: inherit;
+        }
+
+        .saved-memo .memo-edit-buttons {
+            display: flex;
+            gap: 8px;
+            margin-top: 8px;
+        }
+
+        .saved-memo .memo-edit-buttons button {
+            padding: 6px 12px;
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔔 Slack 알림 모니터링</h1>
+
+        <!-- 연결 섹션 -->
+        <div class="card">
+            <h2>🔑 Slack 연결</h2>
+            <div class="connection-section">
+                <input type="password" id="tokenInput" placeholder="Slack Bot Token (xoxb-...)">
+                <button id="connectBtn" onclick="connect()">연결</button>
+                <button id="disconnectBtn" class="danger" onclick="disconnect()" style="display: none;">연결 해제</button>
+                <span id="connectionStatus" class="status disconnected">연결 안됨</span>
+            </div>
+            <div class="sound-toggle">
+                <input type="checkbox" id="soundToggle" checked>
+                <label for="soundToggle">알림음 재생</label>
+            </div>
+        </div>
+
+        <!-- 탭 메뉴 -->
+        <div class="tabs">
+            <button class="tab active" onclick="switchTab('notifications')">🔔 실시간 알림</button>
+            <button class="tab" onclick="switchTab('activity')">📌 내 활동</button>
+            <button class="tab" onclick="switchTab('messages')">💬 채널 메시지</button>
+            <button class="tab" onclick="switchTab('users')">👥 사용자 관리</button>
+            <button class="tab" onclick="switchTab('settings')">⚙️ 설정</button>
+        </div>
+
+        <!-- 실시간 알림 탭 -->
+        <div id="notificationsTab" class="tab-content active">
+            <div class="card">
+                <h2>실시간 멘션 모니터링</h2>
+                <div style="text-align: center; margin-bottom: 15px;">
+                    <button id="startMonitoringBtn" class="success" onclick="startMonitoring()">▶️ 모니터링 시작</button>
+                    <button id="stopMonitoringBtn" class="danger" onclick="stopMonitoring()" style="display: none;">⏸️ 모니터링 중지</button>
+                    <button id="testNotificationBtn" class="warning" onclick="testNotification()" style="display: none; margin-left: 10px;">🧪 테스트 알림</button>
+                    <span id="monitoringStatus"></span>
+                </div>
+
+                <!-- 새 알림 섹션 -->
+                <div class="notification-section new-section" id="newNotifications" style="display: none;">
+                    <div class="section-header">
+                        <h3>🔔 새 알림 (<span id="newCount">0</span>)</h3>
+                    </div>
+                    <div class="section-content" id="newNotificationList"></div>
+                </div>
+
+                <!-- 안 읽은 알림 섹션 -->
+                <div class="notification-section unread-section" id="unreadNotifications" style="display: none;">
+                    <div class="section-header">
+                        <h3>📬 안 읽은 알림 (<span id="unreadCount">0</span>)</h3>
+                    </div>
+                    <div class="section-content" id="unreadNotificationList"></div>
+                </div>
+
+                <!-- 읽은 알림 섹션 -->
+                <div class="notification-section read-section" id="readNotifications" style="display: none;">
+                    <div class="section-header">
+                        <h3>✅ 읽은 알림 (<span id="readCount">0</span>)</h3>
+                    </div>
+                    <div class="section-content" id="readNotificationList"></div>
+                </div>
+
+                <!-- 알림 없음 상태 -->
+                <div class="notification-count" id="notificationCount">알림 대기 중...</div>
+            </div>
+        </div>
+
+        <!-- 내 활동 탭 -->
+        <div id="activityTab" class="tab-content">
+            <div class="card">
+                <h2>내 활동 (나에게 온 멘션)</h2>
+                <p style="margin-bottom: 15px; color: #666; font-size: 14px;">
+                    나에게 직접 온 멘션과 메시지를 확인할 수 있습니다.
+                </p>
+                <div class="message-controls">
+                    <button onclick="loadMyActivity(50)">📥 최근 50개</button>
+                    <button onclick="loadMyActivity(100)">📥 최근 100개</button>
+                    <button onclick="loadMyActivity(200)">📥 최근 200개</button>
+                </div>
+                <div id="activityList"></div>
+            </div>
+        </div>
+
+        <!-- 채널 메시지 탭 -->
+        <div id="messagesTab" class="tab-content">
+            <div class="card">
+                <h2>채널 메시지 조회</h2>
+                <div class="message-controls">
+                    <select id="channelSelect">
+                        <option value="">채널을 선택하세요</option>
+                    </select>
+                    <button onclick="loadMessages(50)">📥 최근 50개</button>
+                    <button onclick="loadMessages(100)">📥 최근 100개</button>
+                    <button onclick="loadMessages(200)">📥 최근 200개</button>
+                </div>
+                <div id="messageList"></div>
+            </div>
+        </div>
+
+        <!-- 사용자 관리 탭 -->
+        <div id="usersTab" class="tab-content">
+            <div class="card">
+                <h2>모니터링 사용자 관리</h2>
+                <p style="margin-bottom: 15px; color: #666; font-size: 14px;">
+                    특정 사용자가 멘션되었을 때 알림을 받을 수 있습니다.
+                </p>
+                <div class="add-user-section">
+                    <input type="text" id="userInput" placeholder="사용자 이름 또는 ID 입력 (예: aiden, U07R293JDV4)">
+                    <button class="success" onclick="addUser()">➕ 추가</button>
+                </div>
+                <div id="userList" class="user-list"></div>
+            </div>
+        </div>
+
+        <!-- 설정 탭 -->
+        <div id="settingsTab" class="tab-content">
+            <div class="card">
+                <h2>⚙️ 우선순위 키워드 관리</h2>
+                <p style="margin-bottom: 20px; color: #666; font-size: 14px;">
+                    메시지 우선순위를 결정하는 키워드를 관리할 수 있습니다.
+                </p>
+
+                <!-- Critical 키워드 -->
+                <div style="margin-bottom: 30px;">
+                    <h3 style="display: flex; align-items: center; gap: 8px; margin-bottom: 10px;">
+                        <span class="priority-badge critical">🔴 CRITICAL</span>
+                        <span style="font-size: 14px; color: #666;">(즉시 대응 필요)</span>
+                    </h3>
+                    <div class="add-user-section">
+                        <input type="text" id="criticalKeywordInput" placeholder="키워드 입력 (예: 심각, severe)">
+                        <button class="danger" onclick="addKeyword('critical')">➕ 추가</button>
+                    </div>
+                    <div id="criticalKeywordList" class="user-list"></div>
+                </div>
+
+                <!-- High 키워드 -->
+                <div style="margin-bottom: 30px;">
+                    <h3 style="display: flex; align-items: center; gap: 8px; margin-bottom: 10px;">
+                        <span class="priority-badge high">🟠 HIGH</span>
+                        <span style="font-size: 14px; color: #666;">(빠른 답변 필요)</span>
+                    </h3>
+                    <div class="add-user-section">
+                        <input type="text" id="highKeywordInput" placeholder="키워드 입력 (예: 요청, request)">
+                        <button class="warning" onclick="addKeyword('high')">➕ 추가</button>
+                    </div>
+                    <div id="highKeywordList" class="user-list"></div>
+                </div>
+
+                <!-- Normal 키워드 -->
+                <div style="margin-bottom: 30px;">
+                    <h3 style="display: flex; align-items: center; gap: 8px; margin-bottom: 10px;">
+                        <span class="priority-badge normal">🔵 NORMAL</span>
+                        <span style="font-size: 14px; color: #666;">(일반 메시지)</span>
+                    </h3>
+                    <div class="add-user-section">
+                        <input type="text" id="normalKeywordInput" placeholder="키워드 입력 (예: 정보, info)">
+                        <button onclick="addKeyword('normal')">➕ 추가</button>
+                    </div>
+                    <div id="normalKeywordList" class="user-list"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let connected = false;
+        let monitoring = false;
+        let eventSource = null;
+        let channelEventSource = null;
+        let currentChannelId = null;
+        let sessionId = Date.now().toString();
+        let notificationCount = 0;
+        let audioContext = null;
+        let notificationStates = {}; // 알림 상태 추적 {notifId: 'new'|'unread'|'read'}
+
+        // 섹션별 카운트 업데이트
+        function updateSectionCounts() {
+            const newCount = Object.values(notificationStates).filter(s => s === 'new').length;
+            const unreadCount = Object.values(notificationStates).filter(s => s === 'unread').length;
+            const readCount = Object.values(notificationStates).filter(s => s === 'read').length;
+
+            document.getElementById('newCount').textContent = newCount;
+            document.getElementById('unreadCount').textContent = unreadCount;
+            document.getElementById('readCount').textContent = readCount;
+
+            // 섹션 표시/숨김
+            document.getElementById('newNotifications').style.display = newCount > 0 ? 'block' : 'none';
+            document.getElementById('unreadNotifications').style.display = unreadCount > 0 ? 'block' : 'none';
+            document.getElementById('readNotifications').style.display = readCount > 0 ? 'block' : 'none';
+
+            // 알림이 하나도 없으면 대기 메시지 표시
+            const totalCount = newCount + unreadCount + readCount;
+            document.getElementById('notificationCount').style.display = totalCount === 0 ? 'block' : 'none';
+        }
+
+        // 알림을 적절한 섹션으로 이동
+        function moveNotificationToSection(notifId, newState) {
+            const oldState = notificationStates[notifId];
+            if (oldState === newState) return;
+
+            const notifElement = document.getElementById(notifId);
+            if (!notifElement) return;
+
+            // 상태 업데이트
+            notificationStates[notifId] = newState;
+
+            // 적절한 리스트로 이동
+            let targetList;
+            if (newState === 'new') {
+                targetList = document.getElementById('newNotificationList');
+            } else if (newState === 'unread') {
+                targetList = document.getElementById('unreadNotificationList');
+            } else {
+                targetList = document.getElementById('readNotificationList');
+            }
+
+            // 리스트 맨 위에 추가
+            targetList.insertBefore(notifElement, targetList.firstChild);
+
+            // 카운트 업데이트
+            updateSectionCounts();
+        }
+
+        // 알림음 재생 함수
+        function playNotificationSound() {
+            if (!document.getElementById('soundToggle').checked) return;
+
+            if (!audioContext) {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            }
+
+            const oscillator = audioContext.createOscillator();
+            const gainNode = audioContext.createGain();
+
+            oscillator.connect(gainNode);
+            gainNode.connect(audioContext.destination);
+
+            oscillator.frequency.value = 800;
+            oscillator.type = 'sine';
+
+            gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
+            gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.5);
+
+            oscillator.start(audioContext.currentTime);
+            oscillator.stop(audioContext.currentTime + 0.5);
+        }
+
+        // Slack 연결
+        async function connect() {
+            const token = document.getElementById('tokenInput').value.trim();
+            if (!token) {
+                alert('토큰을 입력하세요');
+                return;
+            }
+
+            const btn = document.getElementById('connectBtn');
+            const disconnectBtn = document.getElementById('disconnectBtn');
+            btn.disabled = true;
+            btn.textContent = '연결 중...';
+
+            try {
+                const response = await fetch('/api/connect', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({token})
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    connected = true;
+
+                    // localStorage에 토큰 저장
+                    localStorage.setItem('slack_token', token);
+
+                    document.getElementById('connectionStatus').textContent = `연결됨 (${result.user})`;
+                    document.getElementById('connectionStatus').className = 'status connected';
+                    btn.style.display = 'none';
+                    disconnectBtn.style.display = 'inline-block';
+                    document.getElementById('tokenInput').disabled = true;
+
+                    // 채널 목록 로드
+                    loadChannels();
+                    loadWatchedUsers();
+                } else {
+                    alert('연결 실패: ' + result.error);
+                    btn.disabled = false;
+                    btn.textContent = '연결';
+                }
+            } catch (error) {
+                alert('연결 오류: ' + error.message);
+                btn.disabled = false;
+                btn.textContent = '연결';
+            }
+        }
+
+        // 연결 해제
+        function disconnect() {
+            // localStorage에서 토큰 삭제
+            localStorage.removeItem('slack_token');
+
+            // UI 초기화
+            connected = false;
+            document.getElementById('connectionStatus').textContent = '연결 안됨';
+            document.getElementById('connectionStatus').className = 'status disconnected';
+            document.getElementById('connectBtn').style.display = 'inline-block';
+            document.getElementById('connectBtn').textContent = '연결';
+            document.getElementById('connectBtn').className = '';
+            document.getElementById('connectBtn').disabled = false;
+            document.getElementById('disconnectBtn').style.display = 'none';
+            document.getElementById('tokenInput').disabled = false;
+            document.getElementById('tokenInput').value = '';
+
+            // 채널 목록 초기화
+            document.getElementById('channelSelect').innerHTML = '<option value="">채널을 선택하세요</option>';
+            document.getElementById('messageList').innerHTML = '<div class="empty-state">Slack에 연결하세요</div>';
+            document.getElementById('activityList').innerHTML = '<div class="empty-state">Slack에 연결하세요</div>';
+
+            // 모니터링 중지
+            if (eventSource) {
+                eventSource.close();
+                eventSource = null;
+            }
+            if (channelEventSource) {
+                channelEventSource.close();
+                channelEventSource = null;
+            }
+
+            alert('연결이 해제되었습니다');
+        }
+
+        // 페이지 로드 시 자동 연결
+        window.addEventListener('DOMContentLoaded', function() {
+            const savedToken = localStorage.getItem('slack_token');
+            if (savedToken) {
+                document.getElementById('tokenInput').value = savedToken;
+                connect();
+            }
+        });
+
+        // 채널 목록 로드
+        async function loadChannels() {
+            try {
+                const response = await fetch('/api/channels');
+                const result = await response.json();
+
+                if (result.success) {
+                    const select = document.getElementById('channelSelect');
+                    select.innerHTML = '';
+
+                    if (result.channels.length > 0) {
+                        // 첫 번째 채널을 디폴트로 선택
+                        result.channels.forEach((ch, index) => {
+                            const option = document.createElement('option');
+                            option.value = ch.id;
+                            option.textContent = `# ${ch.name}`;
+                            if (index === 0) {
+                                option.selected = true;
+                            }
+                            select.appendChild(option);
+                        });
+
+                        // 첫 번째 채널의 메시지 자동 로드
+                        setTimeout(() => {
+                            loadMessages(50);
+                        }, 100);
+                    } else {
+                        select.innerHTML = '<option value="">채널이 없습니다</option>';
+                    }
+                }
+            } catch (error) {
+                console.error('채널 로드 오류:', error);
+            }
+        }
+
+        // 메시지 로드
+        async function loadMessages(limit) {
+            const channelId = document.getElementById('channelSelect').value;
+            if (!channelId) {
+                alert('채널을 선택하세요');
+                return;
+            }
+
+            const messageList = document.getElementById('messageList');
+            messageList.innerHTML = '<div class="loading">메시지 로딩 중...</div>';
+
+            // currentChannelId 먼저 설정
+            currentChannelId = channelId;
+
+            // 기존 스트림 중지
+            if (channelEventSource) {
+                channelEventSource.close();
+                channelEventSource = null;
+            }
+
+            try {
+                const response = await fetch(`/api/messages/${channelId}?limit=${limit}`);
+                const result = await response.json();
+
+                if (result.success) {
+                    if (result.messages.length === 0) {
+                        messageList.innerHTML = '<div class="empty-state">메시지가 없습니다</div>';
+                        return;
+                    }
+
+                    messageList.innerHTML = '';
+                    // 최신 메시지부터 표시
+                    result.messages.forEach(msg => {
+                        addMessageToList(msg, false); // 하이라이트 없이 추가
+                    });
+
+                    // 실시간 스트리밍 시작
+                    startChannelStream(channelId);
+                }
+            } catch (error) {
+                messageList.innerHTML = '<div class="empty-state">메시지 로드 오류</div>';
+                console.error('메시지 로드 오류:', error);
+            }
+        }
+
+        // 내 활동 메시지 로드
+        async function loadMyActivity(limit) {
+            const activityList = document.getElementById('activityList');
+            activityList.innerHTML = '<div class="loading">내 활동 로딩 중...</div>';
+
+            try {
+                const response = await fetch(`/api/my-activity?limit=${limit}`);
+                const result = await response.json();
+
+                if (result.success) {
+                    if (result.messages.length === 0) {
+                        activityList.innerHTML = '<div class="empty-state">내 활동이 없습니다</div>';
+                        return;
+                    }
+
+                    activityList.innerHTML = '';
+                    result.messages.forEach(msg => {
+                        const div = document.createElement('div');
+                        div.className = 'message-item';
+
+                        const userName = msg.user_name || 'Unknown';
+                        const isBot = msg.is_bot ? ' bot' : '';
+                        const time = new Date(parseFloat(msg.ts) * 1000).toLocaleString('ko-KR');
+                        const channelName = msg.channel_name || msg.channel?.name || 'Unknown';
+                        const activityIcon = msg.activity_icon || '📋';
+                        const activityType = msg.activity_type || '활동';
+
+                        div.innerHTML = `
+                            <div>
+                                <span style="font-size: 16px; margin-right: 5px;">${activityIcon}</span>
+                                <span class="channel">#${channelName}</span>
+                                <span class="user${isBot}">${userName}</span>
+                                <span class="time">${time}</span>
+                                <span class="reason" style="margin-left: 10px;">${activityType}</span>
+                            </div>
+                            <div class="text">${msg.text || '(내용 없음)'}</div>
+                        `;
+
+                        activityList.appendChild(div);
+                    });
+                } else {
+                    activityList.innerHTML = `<div class="empty-state">오류: ${result.error || '알 수 없는 오류'}</div>`;
+                }
+            } catch (error) {
+                activityList.innerHTML = '<div class="empty-state">내 활동 로드 오류</div>';
+                console.error('내 활동 로드 오류:', error);
+            }
+        }
+
+        // 메시지를 리스트에 추가하는 함수
+        function addMessageToList(msg, highlight = true) {
+            const messageList = document.getElementById('messageList');
+            const div = document.createElement('div');
+            div.className = 'message-item';
+
+            const userName = msg.user_name || 'Unknown';
+            const isBot = msg.is_bot ? ' bot' : '';
+            const time = new Date(parseFloat(msg.ts) * 1000).toLocaleString('ko-KR');
+
+            // 스레드 정보 추가
+            let threadIndicator = '';
+            if (msg.has_thread && msg.reply_count > 0) {
+                threadIndicator = `
+                    <span class="thread-indicator" onclick="toggleThread('${currentChannelId}', '${msg.thread_ts}', this)">
+                        💬 ${msg.reply_count}개 답글
+                    </span>
+                `;
+            }
+
+            div.innerHTML = `
+                <div>
+                    <span class="user${isBot}">${userName}</span>
+                    <span class="time">${time}</span>
+                    ${threadIndicator}
+                </div>
+                <div class="text">${msg.text || '(내용 없음)'}</div>
+                <div class="thread-replies" id="thread-${msg.ts}"></div>
+            `;
+
+            // 초기 로드 시에는 맨 아래에 추가 (appendChild)
+            // 실시간 업데이트 시에는 맨 위에 추가 (insertBefore)
+            if (highlight) {
+                // 실시간 새 메시지 - 맨 위에 추가
+                messageList.insertBefore(div, messageList.firstChild);
+
+                // 새 메시지 하이라이트 효과
+                div.style.backgroundColor = '#e8f4f8';
+                setTimeout(() => {
+                    div.style.backgroundColor = '';
+                }, 2000);
+            } else {
+                // 초기 로드 - 맨 아래에 추가 (최신 순서 유지)
+                messageList.appendChild(div);
+            }
+        }
+
+        // 채널 실시간 스트리밍 시작
+        function startChannelStream(channelId) {
+            currentChannelId = channelId;
+
+            console.log('채널 스트림 시작:', channelId);
+
+            // SSE 연결
+            channelEventSource = new EventSource(`/api/channel/stream/${channelId}`);
+
+            channelEventSource.onopen = function() {
+                console.log('채널 SSE 연결 성공');
+            };
+
+            channelEventSource.onmessage = function(event) {
+                console.log('새 메시지 수신:', event.data);
+                const msg = JSON.parse(event.data);
+
+                if (msg.error) {
+                    console.error('채널 스트림 오류:', msg.error);
+                    return;
+                }
+
+                // 새 메시지 추가
+                addMessageToList(msg, true);
+            };
+
+            channelEventSource.onerror = function(err) {
+                console.error('채널 SSE 연결 오류:', err);
+            };
+        }
+
+        // 채널 스트리밍 중지
+        function stopChannelStream() {
+            if (channelEventSource) {
+                channelEventSource.close();
+                channelEventSource = null;
+                currentChannelId = null;
+            }
+        }
+
+        // 스레드 펼치기/접기
+        async function toggleThread(channelId, threadTs, element) {
+            const threadContainer = document.getElementById(`thread-${threadTs}`);
+
+            if (!threadContainer) {
+                console.error('스레드 컨테이너를 찾을 수 없습니다');
+                return;
+            }
+
+            // 이미 펼쳐져 있으면 접기
+            if (threadContainer.classList.contains('expanded')) {
+                threadContainer.classList.remove('expanded');
+                element.innerHTML = `💬 ${element.textContent.match(/\d+/)[0]}개 답글`;
+                return;
+            }
+
+            // 로딩 표시
+            threadContainer.innerHTML = '<div class="thread-loading">답글을 불러오는 중...</div>';
+            threadContainer.classList.add('expanded');
+            element.innerHTML = `💬 ${element.textContent.match(/\d+/)[0]}개 답글 (접기)`;
+
+            try {
+                const response = await fetch(`/api/thread/${channelId}/${threadTs}`);
+                const result = await response.json();
+
+                if (result.success && result.replies && result.replies.length > 0) {
+                    threadContainer.innerHTML = '';
+
+                    result.replies.forEach(reply => {
+                        const replyDiv = document.createElement('div');
+                        replyDiv.className = 'thread-reply';
+
+                        const userName = reply.user_name || 'Unknown';
+                        const isBot = reply.is_bot ? ' bot' : '';
+                        const time = new Date(parseFloat(reply.ts) * 1000).toLocaleString('ko-KR');
+
+                        replyDiv.innerHTML = `
+                            <div>
+                                <span class="user${isBot}">${userName}</span>
+                                <span class="time">${time}</span>
+                            </div>
+                            <div class="text">${reply.text || '(내용 없음)'}</div>
+                        `;
+
+                        threadContainer.appendChild(replyDiv);
+                    });
+                } else {
+                    threadContainer.innerHTML = '<div class="thread-loading">답글이 없습니다</div>';
+                }
+            } catch (error) {
+                console.error('스레드 로드 오류:', error);
+                threadContainer.innerHTML = '<div class="thread-loading">답글 로드 실패</div>';
+            }
+        }
+
+        // 모니터링 시작
+        async function startMonitoring() {
+            if (!connected) {
+                alert('먼저 Slack에 연결하세요');
+                return;
+            }
+
+            try {
+                await fetch('/api/monitoring/start', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({session_id: sessionId})
+                });
+
+                monitoring = true;
+                notificationCount = 0;
+                document.getElementById('notificationCount').textContent = '실시간 모니터링 중...';
+                document.getElementById('startMonitoringBtn').style.display = 'none';
+                document.getElementById('stopMonitoringBtn').style.display = 'inline-block';
+                document.getElementById('testNotificationBtn').style.display = 'inline-block';
+                document.getElementById('monitoringStatus').textContent = '';
+                document.getElementById('monitoringStatus').className = 'status monitoring';
+
+                // Server-Sent Events 연결
+                eventSource = new EventSource(`/api/monitoring/events?session_id=${sessionId}`);
+
+                eventSource.onmessage = function(event) {
+                    const data = JSON.parse(event.data);
+
+                    if (data.error) {
+                        alert('모니터링 오류: ' + data.error);
+                        stopMonitoring();
+                        return;
+                    }
+
+                    // 새 알림 표시
+                    addNotification(data);
+
+                    // 알림음 재생
+                    playNotificationSound();
+
+                    // 브라우저 알림
+                    if (Notification.permission === 'granted') {
+                        new Notification('새로운 Slack 멘션', {
+                            body: `${data.channel}: ${data.text.substring(0, 50)}...`,
+                            icon: '/static/icon.png'
+                        });
+                    }
+                };
+
+                eventSource.onerror = function() {
+                    console.error('SSE 연결 오류');
+                };
+
+                // 브라우저 알림 권한 요청
+                if (Notification.permission === 'default') {
+                    Notification.requestPermission();
+                }
+
+            } catch (error) {
+                alert('모니터링 시작 오류: ' + error.message);
+            }
+        }
+
+        // 모니터링 중지
+        async function stopMonitoring() {
+            try {
+                await fetch('/api/monitoring/stop', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({session_id: sessionId})
+                });
+
+                monitoring = false;
+                document.getElementById('startMonitoringBtn').style.display = 'inline-block';
+                document.getElementById('stopMonitoringBtn').style.display = 'none';
+                document.getElementById('testNotificationBtn').style.display = 'none';
+                document.getElementById('monitoringStatus').textContent = '';
+
+                if (eventSource) {
+                    eventSource.close();
+                    eventSource = null;
+                }
+
+            } catch (error) {
+                alert('모니터링 중지 오류: ' + error.message);
+            }
+        }
+
+        // 테스트 알림 생성
+        async function testNotification() {
+            if (!monitoring) {
+                alert('먼저 모니터링을 시작하세요');
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/monitoring/test', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({session_id: sessionId})
+                });
+
+                const result = await response.json();
+                if (result.success) {
+                    // 테스트 알림은 SSE 스트림을 통해 자동으로 표시됩니다
+                } else {
+                    alert('테스트 알림 생성 실패: ' + (result.error || '알 수 없는 오류'));
+                }
+            } catch (error) {
+                alert('테스트 알림 오류: ' + error.message);
+            }
+        }
+
+        // 알림 추가
+        function addNotification(data) {
+            const div = document.createElement('div');
+            const notifId = `notif-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+
+            // 우선순위 정보 가져오기
+            const priority = data.priority || 'normal';
+            const priorityReason = data.priority_reason || '';
+
+            // 우선순위에 따른 CSS 클래스 추가
+            div.className = `notification-item new priority-${priority}`;
+            div.id = notifId;
+
+            // 메시지 링크 버튼 생성
+            const linkButton = data.message_link
+                ? `<a href="${data.message_link}" target="_blank" class="notification-link-btn" onclick="event.stopPropagation()">🔗 Slack에서 보기</a>`
+                : '';
+
+            // 우선순위 이모지 매핑
+            const priorityEmoji = {
+                'critical': '🔴',
+                'high': '🟠',
+                'normal': '🔵',
+                'low': '⚪'
+            };
+
+            // 우선순위 배지 생성
+            const priorityBadge = `<span class="priority-badge ${priority}">${priorityEmoji[priority]} ${priority}</span>`;
+            const priorityReasonText = priorityReason ? `<span class="priority-reason">🤖 ${priorityReason}</span>` : '';
+
+            div.innerHTML = `
+                <div class="notification-header">
+                    <div>
+                        <div class="time">${data.time}</div>
+                        <div class="channel"># ${data.channel}</div>
+                        <span class="reason">${data.reason}</span>
+                        ${priorityBadge}
+                    </div>
+                    ${linkButton}
+                </div>
+                <div><strong>${data.user}</strong>: ${data.text}</div>
+                ${priorityReasonText}
+                <div class="saved-memo" id="saved-${notifId}" onclick="editMemo('${notifId}')">
+                    <div class="memo-label">📝 메모 (클릭하여 수정)</div>
+                    <div class="memo-content"></div>
+                    <div class="memo-edit-area">
+                        <textarea class="memo-edit-textarea" id="edit-textarea-${notifId}"></textarea>
+                        <div class="memo-edit-buttons">
+                            <button class="success" onclick="event.stopPropagation(); updateMemo('${notifId}')">저장</button>
+                            <button onclick="event.stopPropagation(); cancelEditMemo('${notifId}')">취소</button>
+                        </div>
+                    </div>
+                </div>
+                <div class="notification-memo" id="memo-${notifId}">
+                    <textarea placeholder="메모를 입력하세요... (Ctrl+Enter로 저장)" id="textarea-${notifId}"></textarea>
+                    <div class="memo-buttons">
+                        <button class="success" onclick="saveMemo('${notifId}')">저장</button>
+                        <button onclick="closeMemo('${notifId}')">취소</button>
+                    </div>
+                </div>
+            `;
+
+            // 클릭 이벤트 추가
+            div.addEventListener('click', function(e) {
+                // 버튼, textarea, 링크(a 태그) 클릭 시에는 무시
+                if (e.target.tagName === 'BUTTON' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'A') {
+                    e.stopPropagation();
+                    return;
+                }
+                toggleNotificationRead(notifId);
+            });
+
+            // Ctrl+Enter로 저장하는 키보드 이벤트 추가 (새 메모)
+            const textarea = div.querySelector(`#textarea-${notifId}`);
+            textarea.addEventListener('keydown', function(e) {
+                if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+                    e.preventDefault();
+                    saveMemo(notifId);
+                }
+            });
+
+            // Ctrl+Enter로 저장하는 키보드 이벤트 추가 (메모 수정)
+            const editTextarea = div.querySelector(`#edit-textarea-${notifId}`);
+            editTextarea.addEventListener('keydown', function(e) {
+                if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+                    e.preventDefault();
+                    updateMemo(notifId);
+                }
+            });
+
+            // 새 알림 섹션에 추가
+            const newNotificationList = document.getElementById('newNotificationList');
+            newNotificationList.insertBefore(div, newNotificationList.firstChild);
+
+            // 상태 초기화
+            notificationStates[notifId] = 'new';
+            updateSectionCounts();
+
+            // 깜박임 효과 후 제거하고 안 읽은 알림으로 이동
+            setTimeout(() => {
+                div.classList.remove('new');
+                moveNotificationToSection(notifId, 'unread');
+            }, 3000);
+        }
+
+        // 알림 읽음/안읽음 토글
+        function toggleNotificationRead(notifId) {
+            const notifElement = document.getElementById(notifId);
+            const memoElement = document.getElementById(`memo-${notifId}`);
+            const savedMemoElement = document.getElementById(`saved-${notifId}`);
+            const memoContent = savedMemoElement.querySelector('.memo-content');
+
+            // 읽음으로 표시 및 읽은 알림 섹션으로 이동
+            if (!notifElement.classList.contains('read')) {
+                notifElement.classList.add('read');
+                moveNotificationToSection(notifId, 'read');
+            }
+
+            // 이미 저장된 메모가 있으면 편집 모드로 전환
+            if (savedMemoElement.classList.contains('show') && memoContent.textContent) {
+                editMemo(notifId);
+                return;
+            }
+
+            // 메모 입력창 토글
+            if (memoElement.classList.contains('show')) {
+                memoElement.classList.remove('show');
+            } else {
+                // 다른 메모 입력창 닫기
+                document.querySelectorAll('.notification-memo.show').forEach(m => {
+                    m.classList.remove('show');
+                });
+
+                memoElement.classList.add('show');
+                // textarea에 포커스
+                const textarea = memoElement.querySelector('textarea');
+                if (textarea) {
+                    setTimeout(() => textarea.focus(), 100);
+                }
+            }
+        }
+
+        // 메모 저장
+        function saveMemo(notifId) {
+            const memoElement = document.getElementById(`memo-${notifId}`);
+            const textarea = memoElement.querySelector('textarea');
+            const memoText = textarea.value.trim();
+
+            if (memoText) {
+                const savedMemoElement = document.getElementById(`saved-${notifId}`);
+                const memoContent = savedMemoElement.querySelector('.memo-content');
+                memoContent.textContent = memoText;
+                savedMemoElement.classList.add('show');
+
+                // 메모 입력창 닫기
+                memoElement.classList.remove('show');
+                textarea.value = '';
+
+                // localStorage에 저장
+                const memos = JSON.parse(localStorage.getItem('notification_memos') || '{}');
+                memos[notifId] = {
+                    text: memoText,
+                    timestamp: Date.now()
+                };
+                localStorage.setItem('notification_memos', JSON.stringify(memos));
+            } else {
+                alert('메모를 입력하세요');
+            }
+        }
+
+        // 메모 입력창 닫기
+        function closeMemo(notifId) {
+            const memoElement = document.getElementById(`memo-${notifId}`);
+            memoElement.classList.remove('show');
+        }
+
+        // 메모 편집 모드로 전환
+        function editMemo(notifId) {
+            const savedMemoElement = document.getElementById(`saved-${notifId}`);
+            const memoContent = savedMemoElement.querySelector('.memo-content');
+            const editTextarea = document.getElementById(`edit-textarea-${notifId}`);
+
+            // 기존 메모 내용을 textarea에 로드
+            editTextarea.value = memoContent.textContent;
+
+            // 편집 모드로 전환
+            savedMemoElement.classList.add('editing');
+
+            // textarea에 포커스
+            setTimeout(() => {
+                editTextarea.focus();
+            }, 100);
+        }
+
+        // 메모 수정 저장
+        function updateMemo(notifId) {
+            const savedMemoElement = document.getElementById(`saved-${notifId}`);
+            const editTextarea = document.getElementById(`edit-textarea-${notifId}`);
+            const memoContent = savedMemoElement.querySelector('.memo-content');
+            const memoText = editTextarea.value.trim();
+
+            if (memoText) {
+                // 메모 내용 업데이트
+                memoContent.textContent = memoText;
+
+                // localStorage에 저장
+                const memos = JSON.parse(localStorage.getItem('notification_memos') || '{}');
+                memos[notifId] = {
+                    text: memoText,
+                    timestamp: Date.now()
+                };
+                localStorage.setItem('notification_memos', JSON.stringify(memos));
+
+                // 편집 모드 종료
+                savedMemoElement.classList.remove('editing');
+            } else {
+                // 메모가 비어있으면 삭제
+                if (confirm('메모를 삭제하시겠습니까?')) {
+                    savedMemoElement.classList.remove('show', 'editing');
+                    memoContent.textContent = '';
+
+                    // localStorage에서도 삭제
+                    const memos = JSON.parse(localStorage.getItem('notification_memos') || '{}');
+                    delete memos[notifId];
+                    localStorage.setItem('notification_memos', JSON.stringify(memos));
+                }
+            }
+        }
+
+        // 메모 편집 취소
+        function cancelEditMemo(notifId) {
+            const savedMemoElement = document.getElementById(`saved-${notifId}`);
+            savedMemoElement.classList.remove('editing');
+        }
+
+        // 사용자 추가
+        async function addUser() {
+            const user = document.getElementById('userInput').value.trim();
+            if (!user) {
+                alert('사용자 이름을 입력하세요');
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/users/watched', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({user})
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    document.getElementById('userInput').value = '';
+                    loadWatchedUsers();
+                } else {
+                    alert(result.error);
+                }
+            } catch (error) {
+                alert('사용자 추가 오류: ' + error.message);
+            }
+        }
+
+        // 사용자 제거
+        async function removeUser(user) {
+            try {
+                const response = await fetch(`/api/users/watched/${encodeURIComponent(user)}`, {
+                    method: 'DELETE'
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    loadWatchedUsers();
+                }
+            } catch (error) {
+                alert('사용자 제거 오류: ' + error.message);
+            }
+        }
+
+        // 모니터링 사용자 목록 로드
+        async function loadWatchedUsers() {
+            try {
+                const response = await fetch('/api/users/watched');
+                const result = await response.json();
+
+                const list = document.getElementById('userList');
+
+                if (result.success && result.users.length > 0) {
+                    list.innerHTML = '';
+                    result.users.forEach(user => {
+                        const tag = document.createElement('div');
+                        tag.className = 'user-tag';
+                        tag.innerHTML = `
+                            ${user}
+                            <button onclick="removeUser('${user}')">×</button>
+                        `;
+                        list.appendChild(tag);
+                    });
+                } else {
+                    list.innerHTML = '<div class="empty-state">모니터링 중인 사용자가 없습니다</div>';
+                }
+            } catch (error) {
+                console.error('사용자 목록 로드 오류:', error);
+            }
+        }
+
+        // 탭 전환
+        function switchTab(tabName) {
+            // 메시지 탭에서 나갈 때 스트림 중지
+            if (currentChannelId && tabName !== 'messages') {
+                stopChannelStream();
+            }
+
+            // 모든 탭 비활성화
+            document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
+
+            // 선택한 탭 활성화
+            event.target.classList.add('active');
+            document.getElementById(tabName + 'Tab').classList.add('active');
+
+            // 설정 탭으로 전환 시 키워드 로드
+            if (tabName === 'settings') {
+                loadKeywords();
+            }
+        }
+
+        // 키워드 목록 로드
+        async function loadKeywords() {
+            try {
+                const response = await fetch('/api/priority/keywords');
+                const result = await response.json();
+
+                if (result.success) {
+                    const keywords = result.keywords;
+
+                    // Critical 키워드
+                    renderKeywordList('critical', keywords.critical || []);
+
+                    // High 키워드
+                    renderKeywordList('high', keywords.high || []);
+
+                    // Normal 키워드
+                    renderKeywordList('normal', keywords.normal || []);
+                }
+            } catch (error) {
+                console.error('키워드 로드 오류:', error);
+            }
+        }
+
+        // 키워드 리스트 렌더링
+        function renderKeywordList(priority, keywords) {
+            const listId = priority + 'KeywordList';
+            const list = document.getElementById(listId);
+
+            if (keywords.length === 0) {
+                list.innerHTML = '<div class="empty-state">등록된 키워드가 없습니다</div>';
+                return;
+            }
+
+            list.innerHTML = '';
+            keywords.forEach(keyword => {
+                const tag = document.createElement('div');
+                tag.className = 'user-tag';
+                tag.innerHTML = `
+                    ${keyword}
+                    <button onclick="removeKeyword('${priority}', '${keyword}')">×</button>
+                `;
+                list.appendChild(tag);
+            });
+        }
+
+        // 키워드 추가
+        async function addKeyword(priority) {
+            const inputId = priority + 'KeywordInput';
+            const keyword = document.getElementById(inputId).value.trim();
+
+            if (!keyword) {
+                alert('키워드를 입력하세요');
+                return;
+            }
+
+            try {
+                const response = await fetch(`/api/priority/keywords/${priority}`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({keyword})
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    document.getElementById(inputId).value = '';
+                    loadKeywords();
+                } else {
+                    alert(result.error);
+                }
+            } catch (error) {
+                alert('키워드 추가 오류: ' + error.message);
+            }
+        }
+
+        // 키워드 제거
+        async function removeKeyword(priority, keyword) {
+            try {
+                const response = await fetch(`/api/priority/keywords/${priority}/${encodeURIComponent(keyword)}`, {
+                    method: 'DELETE'
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    loadKeywords();
+                }
+            } catch (error) {
+                alert('키워드 제거 오류: ' + error.message);
+            }
+        }
+
+        // 페이지 로드 시 초기화
+        window.onload = function() {
+            // 저장된 토큰이 있으면 자동 연결 시도 (선택사항)
+        };
+
+        // 페이지 떠날 때 정리
+        window.onbeforeunload = function() {
+            if (monitoring) {
+                stopMonitoring();
+            }
+            if (channelEventSource) {
+                stopChannelStream();
+            }
+        };
+    </script>
+</body>
+</html>
