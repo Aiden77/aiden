@@ -2155,6 +2155,8 @@
         // 별표 추가
         async function addStarred(messageData) {
             try {
+                console.log('API 요청 전송:', messageData);
+
                 const response = await fetch('/api/starred', {
                     method: 'POST',
                     headers: {
@@ -2163,17 +2165,27 @@
                     body: JSON.stringify({ message: messageData })
                 });
 
+                console.log('응답 상태:', response.status, response.statusText);
+
+                if (!response.ok) {
+                    console.error('HTTP 에러:', response.status);
+                    const text = await response.text();
+                    console.error('응답 내용:', text);
+                    return false;
+                }
+
                 const data = await response.json();
+                console.log('응답 데이터:', data);
 
                 if (data.success) {
-                    console.log('별표 추가됨:', data.message);
+                    console.log('✅ 별표 추가 성공:', data.message);
                     return true;
                 } else {
-                    console.error('별표 추가 실패:', data.error);
+                    console.error('❌ 별표 추가 실패:', data.error);
                     return false;
                 }
             } catch (error) {
-                console.error('별표 추가 오류:', error);
+                console.error('❌ 별표 추가 오류:', error);
                 return false;
             }
         }
