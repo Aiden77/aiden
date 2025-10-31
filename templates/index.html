@@ -776,8 +776,38 @@
 
         <!-- 설정 탭 -->
         <div id="settingsTab" class="tab-content">
+            <!-- 일반 설정 -->
             <div class="card">
-                <h2>⚙️ 우선순위 키워드 관리</h2>
+                <h2>⚙️ 일반 설정</h2>
+                <p style="margin-bottom: 20px; color: #666; font-size: 14px;">
+                    개인별 알림 설정을 관리할 수 있습니다.
+                </p>
+
+                <div style="margin-bottom: 20px;">
+                    <div class="sound-toggle" style="margin-top: 0;">
+                        <input type="checkbox" id="settingNotificationSound" checked>
+                        <label for="settingNotificationSound">알림음 재생</label>
+                    </div>
+                </div>
+
+                <div style="margin-bottom: 20px; padding: 15px; background: #f8f9fa; border-radius: 8px; border-left: 4px solid #4CAF50;">
+                    <div style="font-weight: 600; margin-bottom: 8px; color: #333;">⚡ 적응형 폴링 (자동 최적화)</div>
+                    <div style="font-size: 13px; color: #666; line-height: 1.6;">
+                        • 알림 많을 때: <strong>0.2초</strong> 간격 (빠름) ⚡<br>
+                        • 활동 중: <strong>0.5초</strong> 간격 (일반) 📊<br>
+                        • 조용할 때: <strong>1.5초</strong> 간격 (절약) 💤<br>
+                        <span style="color: #4CAF50; margin-top: 5px; display: inline-block;">✓ API 부담을 최소화하면서 빠른 알림 제공</span>
+                    </div>
+                </div>
+
+                <div style="text-align: center;">
+                    <button class="success" onclick="saveSettings()">💾 설정 저장</button>
+                </div>
+            </div>
+
+            <!-- 우선순위 키워드 -->
+            <div class="card">
+                <h2>🎯 우선순위 키워드 관리</h2>
                 <p style="margin-bottom: 20px; color: #666; font-size: 14px;">
                     메시지 우선순위를 결정하는 키워드를 관리할 수 있습니다.
                 </p>
@@ -834,6 +864,130 @@
         let notificationCount = 0;
         let audioContext = null;
         let notificationStates = {}; // 알림 상태 추적 {notifId: 'new'|'unread'|'read'}
+        let reconnectAttempts = 0;
+        let maxReconnectAttempts = 5;
+        let reconnectDelay = 2000; // 2초
+
+        // 로컬 스토리지 키
+        const STORAGE_KEY = 'slack_notifications';
+        const STORAGE_STATES_KEY = 'slack_notification_states';
+
+        // 로컬 스토리지에서 알림 불러오기
+        function loadNotificationsFromStorage() {
+            try {
+                const savedNotifications = localStorage.getItem(STORAGE_KEY);
+                const savedStates = localStorage.getItem(STORAGE_STATES_KEY);
+
+                if (savedNotifications && savedStates) {
+                    const notifications = JSON.parse(savedNotifications);
+                    notificationStates = JSON.parse(savedStates);
+
+                    // 저장된 알림들을 각 섹션에 추가
+                    notifications.forEach(notif => {
+                        try {
+                            addNotificationToDOM(notif);
+                        } catch (err) {
+                            console.error('알림 복원 실패:', notif.id, err);
+                        }
+                    });
+
+                    updateSectionCounts();
+                    console.log(`✅ ${notifications.length}개의 저장된 알림을 불러왔습니다.`);
+                }
+            } catch (e) {
+                console.error('알림 불러오기 실패:', e);
+                // 에러가 있어도 localStorage 클리어하고 계속 진행
+                localStorage.removeItem(STORAGE_KEY);
+                localStorage.removeItem(STORAGE_STATES_KEY);
+            }
+        }
+
+        // 로컬 스토리지에 알림 저장
+        function saveNotificationsToStorage() {
+            try {
+                // 모든 알림 데이터를 수집
+                const allNotifications = [];
+                ['new', 'unread', 'read'].forEach(state => {
+                    const list = document.getElementById(`${state}NotificationList`);
+                    if (list) {
+                        const notifs = list.querySelectorAll('.notification-item');
+                        notifs.forEach(notifEl => {
+                            try {
+                                const notifData = {
+                                    id: notifEl.id,
+                                    html: notifEl.outerHTML,
+                                    state: state
+                                };
+                                allNotifications.push(notifData);
+                            } catch (err) {
+                                console.error('알림 데이터 수집 실패:', notifEl.id, err);
+                            }
+                        });
+                    }
+                });
+
+                localStorage.setItem(STORAGE_KEY, JSON.stringify(allNotifications));
+                localStorage.setItem(STORAGE_STATES_KEY, JSON.stringify(notificationStates));
+            } catch (e) {
+                console.error('알림 저장 실패:', e);
+                // localStorage quota 초과 등의 에러 발생 시 오래된 데이터 삭제
+                try {
+                    localStorage.removeItem(STORAGE_KEY);
+                    localStorage.removeItem(STORAGE_STATES_KEY);
+                } catch (clearErr) {
+                    console.error('localStorage 클리어 실패:', clearErr);
+                }
+            }
+        }
+
+        // 저장된 알림을 DOM에 추가하는 헬퍼 함수
+        function addNotificationToDOM(notifData) {
+            const state = notifData.state;
+            const list = document.getElementById(`${state}NotificationList`);
+            if (!list) return;
+
+            // HTML에서 DOM 요소 생성
+            const tempDiv = document.createElement('div');
+            tempDiv.innerHTML = notifData.html;
+            const notifEl = tempDiv.firstElementChild;
+
+            // 이벤트 리스너 재설정
+            const notifId = notifEl.id;
+
+            // 클릭 이벤트
+            notifEl.addEventListener('click', function(e) {
+                if (e.target.tagName === 'BUTTON' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'A') {
+                    e.stopPropagation();
+                    return;
+                }
+                toggleNotificationRead(notifId);
+            });
+
+            // Ctrl+Enter 키보드 이벤트 (새 메모)
+            const textarea = notifEl.querySelector(`#textarea-${notifId}`);
+            if (textarea) {
+                textarea.addEventListener('keydown', function(e) {
+                    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+                        e.preventDefault();
+                        saveMemo(notifId);
+                    }
+                });
+            }
+
+            // Ctrl+Enter 키보드 이벤트 (메모 수정)
+            const editTextarea = notifEl.querySelector(`#edit-textarea-${notifId}`);
+            if (editTextarea) {
+                editTextarea.addEventListener('keydown', function(e) {
+                    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+                        e.preventDefault();
+                        updateMemo(notifId);
+                    }
+                });
+            }
+
+            // 리스트에 추가
+            list.appendChild(notifEl);
+        }
 
         // 섹션별 카운트 업데이트
         function updateSectionCounts() {
@@ -881,6 +1035,9 @@
 
             // 카운트 업데이트
             updateSectionCounts();
+
+            // 로컬 스토리지에 저장
+            saveNotificationsToStorage();
         }
 
         // 알림음 재생 함수
@@ -993,6 +1150,10 @@
 
         // 페이지 로드 시 자동 연결
         window.addEventListener('DOMContentLoaded', function() {
+            // 저장된 알림 불러오기
+            loadNotificationsFromStorage();
+
+            // 저장된 토큰으로 자동 연결
             const savedToken = localStorage.getItem('slack_token');
             if (savedToken) {
                 document.getElementById('tokenInput').value = savedToken;
@@ -1271,6 +1432,76 @@
             }
         }
 
+        // SSE 연결 함수 (재연결 로직 포함)
+        function connectSSE() {
+            if (eventSource) {
+                eventSource.close();
+                eventSource = null;
+            }
+
+            console.log(`🔌 SSE 연결 시도 중... (시도 ${reconnectAttempts + 1}/${maxReconnectAttempts})`);
+
+            // 연결 상태 표시
+            document.getElementById('monitoringStatus').textContent = '연결 중...';
+            document.getElementById('monitoringStatus').className = 'status monitoring';
+
+            eventSource = new EventSource(`/api/monitoring/events?session_id=${sessionId}`);
+
+            eventSource.onopen = function() {
+                console.log('✅ SSE 연결 성공');
+                reconnectAttempts = 0; // 성공 시 카운터 리셋
+                document.getElementById('monitoringStatus').textContent = '';
+            };
+
+            eventSource.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+
+                if (data.error) {
+                    console.error('모니터링 오류:', data.error);
+                    alert('모니터링 오류: ' + data.error);
+                    stopMonitoring();
+                    return;
+                }
+
+                // 새 알림 표시
+                addNotification(data);
+
+                // 알림음 재생
+                playNotificationSound();
+
+                // 브라우저 알림
+                if (Notification.permission === 'granted') {
+                    new Notification('새로운 Slack 멘션', {
+                        body: `${data.channel}: ${data.text.substring(0, 50)}...`,
+                        icon: '/static/icon.png'
+                    });
+                }
+            };
+
+            eventSource.onerror = function(error) {
+                console.error('❌ SSE 연결 오류:', error);
+
+                // EventSource는 자동으로 재연결을 시도하지만, 서버가 완전히 다운된 경우를 대비
+                if (eventSource.readyState === EventSource.CLOSED) {
+                    console.log('SSE 연결이 닫혔습니다. 재연결 시도...');
+
+                    if (monitoring && reconnectAttempts < maxReconnectAttempts) {
+                        reconnectAttempts++;
+                        document.getElementById('monitoringStatus').textContent = `재연결 중... (${reconnectAttempts}/${maxReconnectAttempts})`;
+
+                        setTimeout(() => {
+                            if (monitoring) {
+                                connectSSE();
+                            }
+                        }, reconnectDelay * reconnectAttempts);
+                    } else if (reconnectAttempts >= maxReconnectAttempts) {
+                        alert('SSE 연결 실패: 최대 재연결 시도 초과. 모니터링을 다시 시작해주세요.');
+                        stopMonitoring();
+                    }
+                }
+            };
+        }
+
         // 모니터링 시작
         async function startMonitoring() {
             if (!connected) {
@@ -1286,44 +1517,15 @@
                 });
 
                 monitoring = true;
+                reconnectAttempts = 0;
                 notificationCount = 0;
                 document.getElementById('notificationCount').textContent = '실시간 모니터링 중...';
                 document.getElementById('startMonitoringBtn').style.display = 'none';
                 document.getElementById('stopMonitoringBtn').style.display = 'inline-block';
                 document.getElementById('testNotificationBtn').style.display = 'inline-block';
-                document.getElementById('monitoringStatus').textContent = '';
-                document.getElementById('monitoringStatus').className = 'status monitoring';
 
-                // Server-Sent Events 연결
-                eventSource = new EventSource(`/api/monitoring/events?session_id=${sessionId}`);
-
-                eventSource.onmessage = function(event) {
-                    const data = JSON.parse(event.data);
-
-                    if (data.error) {
-                        alert('모니터링 오류: ' + data.error);
-                        stopMonitoring();
-                        return;
-                    }
-
-                    // 새 알림 표시
-                    addNotification(data);
-
-                    // 알림음 재생
-                    playNotificationSound();
-
-                    // 브라우저 알림
-                    if (Notification.permission === 'granted') {
-                        new Notification('새로운 Slack 멘션', {
-                            body: `${data.channel}: ${data.text.substring(0, 50)}...`,
-                            icon: '/static/icon.png'
-                        });
-                    }
-                };
-
-                eventSource.onerror = function() {
-                    console.error('SSE 연결 오류');
-                };
+                // SSE 연결 시작
+                connectSSE();
 
                 // 브라우저 알림 권한 요청
                 if (Notification.permission === 'default') {
@@ -1483,6 +1685,9 @@
             notificationStates[notifId] = 'new';
             updateSectionCounts();
 
+            // 로컬 스토리지에 저장
+            saveNotificationsToStorage();
+
             // 깜박임 효과 후 제거하고 안 읽은 알림으로 이동
             setTimeout(() => {
                 div.classList.remove('new');
@@ -1550,6 +1755,9 @@
                     timestamp: Date.now()
                 };
                 localStorage.setItem('notification_memos', JSON.stringify(memos));
+
+                // 알림 전체 저장
+                saveNotificationsToStorage();
             } else {
                 alert('메모를 입력하세요');
             }
@@ -1600,6 +1808,9 @@
 
                 // 편집 모드 종료
                 savedMemoElement.classList.remove('editing');
+
+                // 알림 전체 저장
+                saveNotificationsToStorage();
             } else {
                 // 메모가 비어있으면 삭제
                 if (confirm('메모를 삭제하시겠습니까?')) {
@@ -1610,6 +1821,9 @@
                     const memos = JSON.parse(localStorage.getItem('notification_memos') || '{}');
                     delete memos[notifId];
                     localStorage.setItem('notification_memos', JSON.stringify(memos));
+
+                    // 알림 전체 저장
+                    saveNotificationsToStorage();
                 }
             }
         }
@@ -1707,9 +1921,50 @@
             event.target.classList.add('active');
             document.getElementById(tabName + 'Tab').classList.add('active');
 
-            // 설정 탭으로 전환 시 키워드 로드
+            // 설정 탭으로 전환 시 키워드 및 설정 로드
             if (tabName === 'settings') {
                 loadKeywords();
+                loadSettings();
+            }
+        }
+
+        // 설정 저장
+        async function saveSettings() {
+            const settings = {
+                notification_sound: document.getElementById('settingNotificationSound').checked
+            };
+
+            try {
+                const response = await fetch('/api/settings', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({settings})
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    alert('설정이 저장되었습니다');
+                } else {
+                    alert('설정 저장 실패: ' + result.error);
+                }
+            } catch (error) {
+                alert('설정 저장 오류: ' + error.message);
+            }
+        }
+
+        // 설정 로드
+        async function loadSettings() {
+            try {
+                const response = await fetch('/api/settings');
+                const result = await response.json();
+
+                if (result.success) {
+                    const settings = result.settings;
+                    document.getElementById('settingNotificationSound').checked = settings.notification_sound !== false;
+                }
+            } catch (error) {
+                console.error('설정 로드 오류:', error);
             }
         }
 

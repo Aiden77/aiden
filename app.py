@@ -32,6 +32,9 @@ monitoring_active = {}  # 사용자별 모니터링 상태
 last_check_times = {}  # 사용자별 마지막 체크 시간
 notification_queues = {}  # 사용자별 알림 큐
 
+# 사용자 데이터 디렉토리
+USER_DATA_DIR = 'user_data'
+
 # 전역 캐시 (메모리 기반, TTL 포함)
 _global_user_cache = {}  # {user_id: {"data": user_info, "timestamp": time}}
 _global_bot_cache = {}   # {bot_id: {"data": bot_info, "timestamp": time}}
@@ -105,23 +108,126 @@ def cache_cleanup_thread():
 cleanup_thread = threading.Thread(target=cache_cleanup_thread, daemon=True)
 cleanup_thread.start()
 
+
+# ============================================================
+# 사용자별 데이터 관리 헬퍼 함수
+# ============================================================
+
+def get_user_data_dir(bot_id):
+    """사용자별 데이터 디렉토리 경로 반환"""
+    user_dir = os.path.join(USER_DATA_DIR, bot_id)
+    if not os.path.exists(user_dir):
+        os.makedirs(user_dir, exist_ok=True)
+    return user_dir
+
+def get_user_file_path(bot_id, filename):
+    """사용자별 파일 경로 반환"""
+    return os.path.join(get_user_data_dir(bot_id), filename)
+
+def load_user_watched_users(bot_id):
+    """사용자별 watched_users 로드"""
+    filepath = get_user_file_path(bot_id, 'watched_users.json')
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"⚠️ watched_users 로드 실패 ({bot_id}): {e}")
+            return []
+    return []
+
+def save_user_watched_users(bot_id, users):
+    """사용자별 watched_users 저장"""
+    filepath = get_user_file_path(bot_id, 'watched_users.json')
+    try:
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(users, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        print(f"⚠️ watched_users 저장 실패 ({bot_id}): {e}")
+        return False
+
+def load_user_priority_keywords(bot_id):
+    """사용자별 우선순위 키워드 로드"""
+    filepath = get_user_file_path(bot_id, 'priority_keywords.json')
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"⚠️ priority_keywords 로드 실패 ({bot_id}): {e}")
+            return None
+    return None
+
+def save_user_priority_keywords(bot_id, keywords):
+    """사용자별 우선순위 키워드 저장"""
+    filepath = get_user_file_path(bot_id, 'priority_keywords.json')
+    try:
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(keywords, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        print(f"⚠️ priority_keywords 저장 실패 ({bot_id}): {e}")
+        return False
+
+def load_user_settings(bot_id):
+    """사용자별 설정 로드"""
+    filepath = get_user_file_path(bot_id, 'settings.json')
+    default_settings = {
+        'notification_sound': True,
+        'claude_enabled': CLAUDE_ENABLED
+    }
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                loaded = json.load(f)
+                # 기본 설정과 병합
+                default_settings.update(loaded)
+                return default_settings
+        except Exception as e:
+            print(f"⚠️ settings 로드 실패 ({bot_id}): {e}")
+            return default_settings
+    return default_settings
+
+def save_user_settings(bot_id, settings):
+    """사용자별 설정 저장"""
+    filepath = get_user_file_path(bot_id, 'settings.json')
+    try:
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(settings, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        print(f"⚠️ settings 저장 실패 ({bot_id}): {e}")
+        return False
+
+def get_user_priority_keywords(bot_id):
+    """사용자별 우선순위 키워드 가져오기 (기본값 포함)"""
+    user_keywords = load_user_priority_keywords(bot_id)
+    if user_keywords:
+        return user_keywords
+    # 기본 키워드 반환
+    return PRIORITY_KEYWORDS.copy()
+
 # 우선순위 분류 함수
-def classify_message_by_keywords(text):
+def classify_message_by_keywords(text, keywords=None):
     """키워드 기반 빠른 우선순위 분류"""
+    if keywords is None:
+        keywords = PRIORITY_KEYWORDS
+
     text_lower = text.lower()
 
     # Critical 키워드 확인
-    for keyword in PRIORITY_KEYWORDS['critical']:
+    for keyword in keywords.get('critical', []):
         if keyword.lower() in text_lower:
             return 'critical', f'키워드 매칭: {keyword}'
 
     # High 키워드 확인
-    for keyword in PRIORITY_KEYWORDS['high']:
+    for keyword in keywords.get('high', []):
         if keyword in text_lower:
             return 'high', f'키워드 매칭: {keyword}'
 
     # Normal 키워드 확인
-    for keyword in PRIORITY_KEYWORDS['normal']:
+    for keyword in keywords.get('normal', []):
         if keyword in text_lower:
             return 'normal', f'키워드 매칭: {keyword}'
 
@@ -166,10 +272,10 @@ def classify_message_with_claude(text, sender, channel):
         print(f"⚠️ Claude API 오류: {e}")
         return None, f'API 오류: {str(e)}'
 
-def classify_message_priority(text, sender='', channel=''):
+def classify_message_priority(text, sender='', channel='', keywords=None):
     """하이브리드 우선순위 분류 (키워드 + Claude API)"""
     # 1단계: 빠른 키워드 필터링
-    priority, reason = classify_message_by_keywords(text)
+    priority, reason = classify_message_by_keywords(text, keywords)
 
     # Critical 또는 High가 아니면 Claude API로 재검증 (선택적)
     if CLAUDE_ENABLED and priority == 'normal' and len(text) > 20:
@@ -182,18 +288,22 @@ def classify_message_priority(text, sender='', channel=''):
 
 
 class SlackNotifier:
-    def __init__(self, token):
+    def __init__(self, token, bot_id=None):
         self.token = token
         self.headers = {"Authorization": f"Bearer {token}"}
-        self.bot_user_id = None
+        self.bot_user_id = bot_id
         self.watched_users = []
         self.watched_user_ids = []  # username을 user_id로 변환한 캐시
         self.team_url = None  # 워크스페이스 URL
+        # 우선순위 키워드 (사용자별)
+        self.priority_keywords = None
         # 정규표현식 컴파일 (성능 향상)
         self.mention_pattern = re.compile(r'<@([A-Z0-9]+)>')
         # HTTP 세션 재사용 (연결 풀링으로 성능 향상)
         self.session = requests.Session()
         self.session.headers.update(self.headers)
+        # 타임아웃 설정 (connect timeout: 5초, read timeout: 10초)
+        self.timeout = (5, 10)
         # User Group 캐시 (ID -> handle 매핑)
         self._usergroups_cache = {}  # {subteam_id: handle}
         self._usergroups_cache_time = 0  # 캐시 생성 시간
@@ -206,7 +316,7 @@ class SlackNotifier:
     def test_connection(self):
         """Slack 연결 테스트 및 봇 정보 가져오기"""
         try:
-            response = self.session.get("https://slack.com/api/auth.test")
+            response = self.session.get("https://slack.com/api/auth.test", timeout=self.timeout)
             data = response.json()
 
             print(f"\n=== auth.test 응답 ===")
@@ -263,7 +373,8 @@ class SlackNotifier:
         try:
             response = self.session.get(
                 "https://slack.com/api/users.conversations",
-                params={"types": "public_channel,private_channel"}
+                params={"types": "public_channel,private_channel"},
+                timeout=self.timeout
             )
             data = response.json()
 
@@ -286,7 +397,8 @@ class SlackNotifier:
         try:
             response = self.session.get(
                 "https://slack.com/api/conversations.history",
-                params={"channel": channel_id, "limit": limit}
+                params={"channel": channel_id, "limit": limit},
+                timeout=self.timeout
             )
             data = response.json()
 
@@ -384,7 +496,8 @@ class SlackNotifier:
         try:
             response = self.session.get(
                 "https://slack.com/api/users.info",
-                params={"user": user_id}
+                params={"user": user_id},
+                timeout=self.timeout
             )
             data = response.json()
 
@@ -418,7 +531,7 @@ class SlackNotifier:
 
             # 캐시 미스 시 API 호출
             if members is None:
-                response = self.session.get("https://slack.com/api/users.list")
+                response = self.session.get("https://slack.com/api/users.list", timeout=self.timeout)
                 data = response.json()
 
                 if data.get("ok"):
@@ -469,7 +582,7 @@ class SlackNotifier:
             response = self.session.get(
                 "https://slack.com/api/bots.info",
                 params={"bot": bot_id}
-            )
+            , timeout=self.timeout)
             data = response.json()
 
             if data.get("ok"):
@@ -562,7 +675,7 @@ class SlackNotifier:
                     "channel": channel_id,
                     "ts": thread_ts
                 }
-            )
+            , timeout=self.timeout)
             data = response.json()
 
             if data.get("ok"):
@@ -661,7 +774,7 @@ class SlackNotifier:
                             "channel": channel_id,
                             "limit": 100  # 각 채널에서 최근 100개 확인
                         }
-                    )
+                    , timeout=self.timeout)
                     data = response.json()
 
                     if data.get("ok"):
@@ -721,7 +834,7 @@ class SlackNotifier:
                         "types": "im",  # Direct Message
                         "limit": 100
                     }
-                )
+                , timeout=self.timeout)
                 dm_data = dm_response.json()
 
                 if dm_data.get("ok"):
@@ -738,7 +851,7 @@ class SlackNotifier:
                                     "channel": dm_id,
                                     "limit": 20
                                 }
-                            )
+                            , timeout=self.timeout)
                             dm_history_data = dm_history.json()
 
                             if dm_history_data.get("ok"):
@@ -852,7 +965,7 @@ class SlackNotifier:
                 list_response = self.session.get(
                     "https://slack.com/api/usergroups.list",
                     params={"include_users": False}
-                )
+                , timeout=self.timeout)
                 list_data = list_response.json()
                 if list_data.get("ok"):
                     # 전체 캐시 갱신
@@ -881,7 +994,7 @@ class SlackNotifier:
             response = self.session.get(
                 "https://slack.com/api/usergroups.users.list",
                 params={"usergroup": subteam_id}
-            )
+            , timeout=self.timeout)
             data = response.json()
             if data.get("ok"):
                 members = data.get("users", [])
@@ -915,7 +1028,8 @@ class SlackNotifier:
                         "channel": channel_id,
                         "oldest": str(since_timestamp),
                         "limit": 100
-                    }
+                    },
+                    timeout=self.timeout
                 )
                 data = response.json()
 
@@ -957,12 +1071,20 @@ class SlackNotifier:
 
                                 # User Group 멤버 확인 (캐싱 사용)
                                 members = self.get_usergroup_members(subteam_id)
-                                # 감시 중인 사용자가 그룹에 속해있는지 확인
+
+                                # 1) 감시 중인 사용자가 그룹에 속해있는지 확인
                                 for watched_user_id in self.watched_user_ids:
                                     if watched_user_id in members:
                                         is_notification = True
                                         notification_reason = f"그룹 멘션 (@{group_name})"
                                         break
+
+                                # 2) watched_users가 비어있거나, 봇 자신이 그룹 멤버인 경우
+                                if not is_notification:
+                                    if not self.watched_user_ids or self.bot_user_id in members:
+                                        is_notification = True
+                                        notification_reason = f"그룹 멘션 (@{group_name})"
+
                                 if is_notification:
                                     break
 
@@ -992,8 +1114,11 @@ class SlackNotifier:
                             # 메시지 링크 생성
                             message_link = self.get_message_link(channel_id, str(ts))
 
-                            # 우선순위 분류
-                            priority, priority_reason = classify_message_priority(text, display_name, channel_name)
+                            # 우선순위 분류 (사용자별 키워드 사용)
+                            priority, priority_reason = classify_message_priority(
+                                text, display_name, channel_name,
+                                keywords=self.priority_keywords
+                            )
 
                             channel_notifications.append({
                                 "channel": channel_name,
@@ -1033,7 +1158,7 @@ class SlackNotifier:
                     "types": "im",  # Direct Message
                     "limit": 100
                 }
-            )
+            , timeout=self.timeout)
             dm_data = dm_response.json()
 
             if dm_data.get("ok"):
@@ -1049,7 +1174,8 @@ class SlackNotifier:
                                 "channel": dm_id,
                                 "oldest": str(since_timestamp),
                                 "limit": 50
-                            }
+                            },
+                            timeout=self.timeout
                         )
                         dm_history_data = dm_history.json()
 
@@ -1325,71 +1451,116 @@ def monitoring_events():
     bot_id = session.get('bot_id')
     team_url = session.get('team_url', '')
 
-    print(f"=== /api/monitoring/events 요청됨 (session_id={session_id}) ===")
+    print(f"🔥 SSE 연결 요청 (session_id={session_id}, bot_id={bot_id})", flush=True)
 
     def generate():
         # 클로저로 session_id, token, bot_id, team_url 사용
-
         if not token:
+            print(f"❌ 토큰 없음 (session_id={session_id})", flush=True)
             yield f"data: {json.dumps({'error': '연결되지 않음'})}\n\n"
             return
 
-        notifier = SlackNotifier(token)
-        notifier.bot_user_id = bot_id
-        notifier.team_url = team_url
+        try:
+            notifier = SlackNotifier(token, bot_id)
+            notifier.team_url = team_url
 
-        # watched_users 로드
-        watched_users_file = 'watched_users.json'
-        if os.path.exists(watched_users_file):
-            try:
-                with open(watched_users_file, 'r', encoding='utf-8') as f:
-                    notifier.watched_users = json.load(f)
-            except:
-                notifier.watched_users = []
+            # watched_users 로드 (사용자별)
+            notifier.watched_users = load_user_watched_users(bot_id)
 
-        # watched_users를 user_id로 변환 (초기화 시 한 번만)
-        notifier.refresh_watched_user_ids()
+            # 우선순위 키워드 로드 (사용자별)
+            notifier.priority_keywords = get_user_priority_keywords(bot_id)
 
-        # 감시 사용자 목록 리로드 타이머
-        last_reload_time = time.time()
-        reload_interval = 5  # 5초마다 watched_users.json 다시 읽기
+            # watched_users를 user_id로 변환 (초기화 시 한 번만)
+            notifier.refresh_watched_user_ids()
+
+            # 적응형 폴링 설정
+            polling_fast = 0.2      # 빠른 모드: 알림 있을 때
+            polling_normal = 0.5    # 일반 모드: 활동 중
+            polling_slow = 1.5      # 느린 모드: 알림 없을 때
+            current_polling = polling_normal
+
+            # 폴링 속도 조정을 위한 변수
+            consecutive_empty_checks = 0  # 연속 빈 체크 횟수
+            last_notification_time = time.time()
+
+            # 감시 사용자 목록 리로드 타이머
+            last_reload_time = time.time()
+            reload_interval = 5  # 5초마다 watched_users 다시 읽기
+
+            # 연결 성공 heartbeat 전송
+            yield f": heartbeat\n\n"
+
+            print(f"✅ SSE 연결 성공 (session_id={session_id}, watched_users={notifier.watched_users}, adaptive_polling=ON)", flush=True)
+        except Exception as e:
+            print(f"❌ SSE 초기화 오류: {e}", flush=True)
+            yield f"data: {json.dumps({'error': f'초기화 실패: {str(e)}'})}\n\n"
+            return
 
         while True:
-            if session_id in monitoring_active and monitoring_active[session_id]:
-                # 0. 주기적으로 watched_users.json 리로드
-                current_time = time.time()
-                if current_time - last_reload_time >= reload_interval:
-                    try:
-                        with open(watched_users_file, 'r', encoding='utf-8') as f:
-                            new_watched_users = json.load(f)
-                        # 변경 사항이 있으면 리로드
-                        if new_watched_users != notifier.watched_users:
-                            notifier.watched_users = new_watched_users
-                            notifier.refresh_watched_user_ids()
-                            print(f"🔄 감시 사용자 목록 리로드됨: {notifier.watched_users}")
-                        last_reload_time = current_time
-                    except Exception as e:
-                        print(f"⚠️ watched_users.json 리로드 실패: {e}")
+            try:
+                if session_id in monitoring_active and monitoring_active[session_id]:
+                    # 0. 주기적으로 watched_users 리로드 (사용자별)
+                    current_time = time.time()
+                    if current_time - last_reload_time >= reload_interval:
+                        try:
+                            new_watched_users = load_user_watched_users(bot_id)
+                            # 변경 사항이 있으면 리로드
+                            if new_watched_users != notifier.watched_users:
+                                notifier.watched_users = new_watched_users
+                                notifier.refresh_watched_user_ids()
+                                print(f"🔄 감시 사용자 목록 리로드됨 ({bot_id}): {notifier.watched_users}")
+                            last_reload_time = current_time
+                        except Exception as e:
+                            print(f"⚠️ watched_users 리로드 실패: {e}")
 
-                # 1. 큐에 있는 테스트 알림 먼저 전송
-                if session_id in notification_queues and notification_queues[session_id]:
-                    queued_notifications = notification_queues[session_id][:]
-                    notification_queues[session_id] = []
-                    for notif in queued_notifications:
-                        yield f"data: {json.dumps(notif)}\n\n"
+                    # 1. 큐에 있는 테스트 알림 먼저 전송
+                    if session_id in notification_queues and notification_queues[session_id]:
+                        queued_notifications = notification_queues[session_id][:]
+                        notification_queues[session_id] = []
+                        for notif in queued_notifications:
+                            yield f"data: {json.dumps(notif)}\n\n"
 
-                # 2. 실제 Slack 알림 확인
-                since = last_check_times.get(session_id, time.time())
-                notifications, max_timestamp = notifier.check_new_mentions(since)
+                    # 2. 실제 Slack 알림 확인
+                    since = last_check_times.get(session_id, time.time())
+                    notifications, max_timestamp = notifier.check_new_mentions(since)
 
-                if notifications:
-                    for notif in notifications:
-                        yield f"data: {json.dumps(notif)}\n\n"
+                    if notifications:
+                        # 알림이 있으면 빠른 모드로 전환
+                        consecutive_empty_checks = 0
+                        current_polling = polling_fast
+                        last_notification_time = time.time()
 
-                # 가장 최신 메시지 timestamp로 업데이트 (time.time() 대신)
-                last_check_times[session_id] = max_timestamp
+                        print(f"🔔 {len(notifications)}개 알림 전송 (session_id={session_id}, polling={current_polling}s)", flush=True)
+                        for i, notif in enumerate(notifications):
+                            print(f"  [{i+1}] {notif.get('reason')}: {notif.get('channel')} - {notif.get('text')[:50]}", flush=True)
+                            yield f"data: {json.dumps(notif)}\n\n"
+                    else:
+                        # 알림이 없으면 점점 느리게
+                        consecutive_empty_checks += 1
 
-            time.sleep(1)  # 1초마다 체크 (응답속도 최적화)
+                        if consecutive_empty_checks >= 6:
+                            # 6회 이상 빈 체크: 느린 모드 (1.5초)
+                            current_polling = polling_slow
+                        elif consecutive_empty_checks >= 3:
+                            # 3-5회 빈 체크: 일반 모드 (0.5초)
+                            current_polling = polling_normal
+                        # else: 1-2회는 빠른 모드 유지 (0.2초)
+
+                    # 가장 최신 메시지 timestamp로 업데이트 (time.time() 대신)
+                    last_check_times[session_id] = max_timestamp
+
+                time.sleep(current_polling)
+
+            except GeneratorExit:
+                # 클라이언트 연결 종료
+                print(f"🔌 SSE 연결 종료됨 (session_id={session_id})", flush=True)
+                break
+            except Exception as e:
+                print(f"⚠️ 모니터링 루프 오류: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
+                # 에러가 나도 계속 진행
+                time.sleep(1)
 
     return Response(generate(), mimetype='text/event-stream')
 
@@ -1452,68 +1623,55 @@ def channel_stream(channel_id):
 
 @app.route('/api/users/watched', methods=['GET'])
 def get_watched_users():
-    """모니터링 사용자 목록 조회"""
-    watched_users_file = 'watched_users.json'
+    """모니터링 사용자 목록 조회 (사용자별)"""
+    bot_id = session.get('bot_id')
+    if not bot_id:
+        return jsonify({"success": False, "error": "연결되지 않음"})
 
-    if os.path.exists(watched_users_file):
-        try:
-            with open(watched_users_file, 'r', encoding='utf-8') as f:
-                users = json.load(f)
-                return jsonify({"success": True, "users": users})
-        except:
-            return jsonify({"success": True, "users": []})
-
-    return jsonify({"success": True, "users": []})
+    users = load_user_watched_users(bot_id)
+    return jsonify({"success": True, "users": users})
 
 
 @app.route('/api/users/watched', methods=['POST'])
 def add_watched_user():
-    """모니터링 사용자 추가"""
+    """모니터링 사용자 추가 (사용자별)"""
+    bot_id = session.get('bot_id')
+    if not bot_id:
+        return jsonify({"success": False, "error": "연결되지 않음"})
+
     data = request.json
     user = data.get('user', '').strip()
 
     if not user:
         return jsonify({"success": False, "error": "사용자 이름이 필요합니다"})
 
-    watched_users_file = 'watched_users.json'
-    users = []
-
-    if os.path.exists(watched_users_file):
-        try:
-            with open(watched_users_file, 'r', encoding='utf-8') as f:
-                users = json.load(f)
-        except:
-            users = []
+    users = load_user_watched_users(bot_id)
 
     if user not in users:
         users.append(user)
-        with open(watched_users_file, 'w', encoding='utf-8') as f:
-            json.dump(users, f, ensure_ascii=False, indent=2)
-
-        return jsonify({"success": True, "users": users})
+        if save_user_watched_users(bot_id, users):
+            return jsonify({"success": True, "users": users})
+        else:
+            return jsonify({"success": False, "error": "저장 실패"})
 
     return jsonify({"success": False, "error": "이미 추가된 사용자입니다"})
 
 
 @app.route('/api/users/watched/<user>', methods=['DELETE'])
 def remove_watched_user(user):
-    """모니터링 사용자 제거"""
-    watched_users_file = 'watched_users.json'
-    users = []
+    """모니터링 사용자 제거 (사용자별)"""
+    bot_id = session.get('bot_id')
+    if not bot_id:
+        return jsonify({"success": False, "error": "연결되지 않음"})
 
-    if os.path.exists(watched_users_file):
-        try:
-            with open(watched_users_file, 'r', encoding='utf-8') as f:
-                users = json.load(f)
-        except:
-            users = []
+    users = load_user_watched_users(bot_id)
 
     if user in users:
         users.remove(user)
-        with open(watched_users_file, 'w', encoding='utf-8') as f:
-            json.dump(users, f, ensure_ascii=False, indent=2)
-
-        return jsonify({"success": True, "users": users})
+        if save_user_watched_users(bot_id, users):
+            return jsonify({"success": True, "users": users})
+        else:
+            return jsonify({"success": False, "error": "저장 실패"})
 
     return jsonify({"success": False, "error": "사용자를 찾을 수 없습니다"})
 
@@ -1542,17 +1700,28 @@ def get_thread(channel_id, thread_ts):
 
 @app.route('/api/priority/keywords', methods=['GET'])
 def get_priority_keywords():
-    """우선순위 키워드 목록 조회"""
+    """우선순위 키워드 목록 조회 (사용자별)"""
+    bot_id = session.get('bot_id')
+    if not bot_id:
+        return jsonify({"success": False, "error": "연결되지 않음"})
+
+    keywords = get_user_priority_keywords(bot_id)
     return jsonify({
         'success': True,
-        'keywords': PRIORITY_KEYWORDS
+        'keywords': keywords
     })
 
 @app.route('/api/priority/keywords/<priority>', methods=['POST'])
 def add_priority_keyword(priority):
-    """우선순위 키워드 추가"""
+    """우선순위 키워드 추가 (사용자별)"""
+    bot_id = session.get('bot_id')
+    if not bot_id:
+        return jsonify({"success": False, "error": "연결되지 않음"})
+
     try:
-        if priority not in PRIORITY_KEYWORDS:
+        keywords = get_user_priority_keywords(bot_id)
+
+        if priority not in keywords:
             return jsonify({'success': False, 'error': '잘못된 우선순위입니다'})
 
         data = request.json
@@ -1561,43 +1730,86 @@ def add_priority_keyword(priority):
         if not keyword:
             return jsonify({'success': False, 'error': '키워드를 입력하세요'})
 
-        if keyword in PRIORITY_KEYWORDS[priority]:
+        if keyword in keywords[priority]:
             return jsonify({'success': False, 'error': '이미 존재하는 키워드입니다'})
 
-        PRIORITY_KEYWORDS[priority].append(keyword)
+        keywords[priority].append(keyword)
 
-        return jsonify({
-            'success': True,
-            'keywords': PRIORITY_KEYWORDS
-        })
+        # 사용자별 키워드 저장
+        if save_user_priority_keywords(bot_id, keywords):
+            return jsonify({
+                'success': True,
+                'keywords': keywords
+            })
+        else:
+            return jsonify({'success': False, 'error': '저장 실패'})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/api/priority/keywords/<priority>/<keyword>', methods=['DELETE'])
 def delete_priority_keyword(priority, keyword):
-    """우선순위 키워드 삭제"""
+    """우선순위 키워드 삭제 (사용자별)"""
+    bot_id = session.get('bot_id')
+    if not bot_id:
+        return jsonify({"success": False, "error": "연결되지 않음"})
+
     try:
-        if priority not in PRIORITY_KEYWORDS:
+        keywords = get_user_priority_keywords(bot_id)
+
+        if priority not in keywords:
             return jsonify({'success': False, 'error': '잘못된 우선순위입니다'})
 
-        if keyword not in PRIORITY_KEYWORDS[priority]:
+        if keyword not in keywords[priority]:
             return jsonify({'success': False, 'error': '키워드를 찾을 수 없습니다'})
 
-        PRIORITY_KEYWORDS[priority].remove(keyword)
+        keywords[priority].remove(keyword)
 
-        return jsonify({
-            'success': True,
-            'keywords': PRIORITY_KEYWORDS
-        })
+        # 사용자별 키워드 저장
+        if save_user_priority_keywords(bot_id, keywords):
+            return jsonify({
+                'success': True,
+                'keywords': keywords
+            })
+        else:
+            return jsonify({'success': False, 'error': '저장 실패'})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
 
+# ============================================================
+# 사용자별 설정 관리 API
+# ============================================================
+
+@app.route('/api/settings', methods=['GET'])
+def get_settings():
+    """사용자별 설정 조회"""
+    bot_id = session.get('bot_id')
+    if not bot_id:
+        return jsonify({"success": False, "error": "연결되지 않음"})
+
+    settings = load_user_settings(bot_id)
+    return jsonify({"success": True, "settings": settings})
+
+@app.route('/api/settings', methods=['POST'])
+def update_settings():
+    """사용자별 설정 업데이트"""
+    bot_id = session.get('bot_id')
+    if not bot_id:
+        return jsonify({"success": False, "error": "연결되지 않음"})
+
+    data = request.json
+    settings = data.get('settings', {})
+
+    if save_user_settings(bot_id, settings):
+        return jsonify({"success": True, "settings": settings})
+    else:
+        return jsonify({"success": False, "error": "저장 실패"})
+
+
 if __name__ == '__main__':
-    # watched_users.json 파일이 없으면 생성
-    if not os.path.exists('watched_users.json'):
-        with open('watched_users.json', 'w', encoding='utf-8') as f:
-            json.dump([], f)
+    # user_data 디렉토리 생성
+    if not os.path.exists(USER_DATA_DIR):
+        os.makedirs(USER_DATA_DIR, exist_ok=True)
 
     print("=" * 60)
     print("🌐 Slack 알림 모니터링 웹 서버 시작")

@@ -1,6 +1,8 @@
 # Slack 민감 정보
 slack_token.txt
 watched_users.json
+user_data/
+*.backup
 
 # Python
 __pycache__/
