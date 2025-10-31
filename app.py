@@ -1476,7 +1476,7 @@ def monitoring_events():
             # 적응형 폴링 설정
             polling_fast = 0.2      # 빠른 모드: 알림 있을 때
             polling_normal = 0.5    # 일반 모드: 활동 중
-            polling_slow = 1.5      # 느린 모드: 알림 없을 때
+            polling_slow = 0.8      # 느린 모드: 알림 없을 때
             current_polling = polling_normal
 
             # 폴링 속도 조정을 위한 변수
