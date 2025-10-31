@@ -1615,6 +1615,16 @@
             div.className = `notification-item new priority-${priority}`;
             div.id = notifId;
 
+            // 별표용 데이터 속성 저장
+            div.setAttribute('data-channel-id', data.channel_id || '');
+            div.setAttribute('data-channel-name', data.channel || '');
+            div.setAttribute('data-ts', data.ts || '');
+            div.setAttribute('data-user', data.user || '');
+            div.setAttribute('data-text', data.text || '');
+            div.setAttribute('data-time', data.time || '');
+            div.setAttribute('data-reason', data.reason || '');
+            div.setAttribute('data-priority', data.priority || 'normal');
+
             // 메시지 링크 버튼 생성
             const linkButton = data.message_link
                 ? `<a href="${data.message_link}" target="_blank" class="notification-link-btn" onclick="event.stopPropagation()">🔗 Slack에서 보기</a>`
@@ -1640,11 +1650,11 @@
                         <span class="reason">${data.reason}</span>
                         ${priorityBadge}
                     </div>
-                    <div style="display: flex; gap: 8px;">
-                        <button class="star-btn" onclick="event.stopPropagation(); toggleStar('${notifId}', ${JSON.stringify(data)})"
+                    <div style="display: flex; gap: 8px; align-items: center;">
+                        <button class="star-btn" onclick="event.stopPropagation(); toggleStar('${notifId}')"
                                 id="star-${notifId}"
                                 title="중요 메시지로 저장"
-                                style="background: transparent; border: none; font-size: 20px; cursor: pointer; padding: 4px 8px;">☆</button>
+                                style="background: #f5f5f5; border: 1px solid #ddd; border-radius: 4px; font-size: 24px; cursor: pointer; padding: 6px 12px; transition: all 0.2s;">☆</button>
                         ${linkButton}
                     </div>
                 </div>
@@ -2206,36 +2216,41 @@
         }
 
         // 별표 토글
-        async function toggleStar(notifId, data) {
+        async function toggleStar(notifId) {
             const starBtn = document.getElementById(`star-${notifId}`);
-            const isStarred = starBtn.textContent === '⭐';
+            const notifDiv = document.getElementById(notifId);
+            const isStarred = starBtn.textContent.trim() === '⭐';
 
             if (isStarred) {
                 // 별표 제거 - 아직 message_id가 없으므로 다른 방식으로 처리
-                console.log('별표 제거는 중요 메시지 탭에서 가능합니다.');
+                alert('별표 제거는 "⭐ 중요 메시지" 탭에서 가능합니다.');
                 return;
             }
 
-            // 별표 추가
+            // DOM에서 데이터 가져오기
             const messageData = {
-                channel_id: data.channel_id || '',
-                channel_name: data.channel || '',
-                ts: data.ts || '',
-                user: data.user || '',
-                text: data.text || '',
-                time: data.time || '',
-                reason: data.reason || '',
-                priority: data.priority || 'normal'
+                channel_id: notifDiv.getAttribute('data-channel-id') || '',
+                channel_name: notifDiv.getAttribute('data-channel-name') || '',
+                ts: notifDiv.getAttribute('data-ts') || '',
+                user: notifDiv.getAttribute('data-user') || '',
+                text: notifDiv.getAttribute('data-text') || '',
+                time: notifDiv.getAttribute('data-time') || '',
+                reason: notifDiv.getAttribute('data-reason') || '',
+                priority: notifDiv.getAttribute('data-priority') || 'normal'
             };
+
+            console.log('별표 추가 시도:', messageData);
 
             const success = await addStarred(messageData);
 
             if (success) {
                 starBtn.textContent = '⭐';
+                starBtn.style.background = '#fff9e6';
+                starBtn.style.borderColor = '#ffc107';
                 starBtn.style.color = '#ffc107';
-                console.log('⭐ 중요 메시지로 저장되었습니다');
+                alert('⭐ 중요 메시지로 저장되었습니다!');
             } else {
-                console.error('별표 추가 실패');
+                alert('별표 추가 실패. 콘솔을 확인하세요.');
             }
         }
 
