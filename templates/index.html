@@ -681,6 +681,7 @@
         <!-- 탭 메뉴 -->
         <div class="tabs">
             <button class="tab active" onclick="switchTab('notifications')">🔔 실시간 알림</button>
+            <button class="tab" onclick="switchTab('starred')">⭐ 중요 메시지</button>
             <button class="tab" onclick="switchTab('activity')">📌 내 활동</button>
             <button class="tab" onclick="switchTab('messages')">💬 채널 메시지</button>
             <button class="tab" onclick="switchTab('users')">👥 사용자 관리</button>
@@ -724,6 +725,20 @@
 
                 <!-- 알림 없음 상태 -->
                 <div class="notification-count" id="notificationCount">알림 대기 중...</div>
+            </div>
+        </div>
+
+        <!-- 중요 메시지 탭 -->
+        <div id="starredTab" class="tab-content">
+            <div class="card">
+                <h2>⭐ 중요 메시지</h2>
+                <p style="margin-bottom: 15px; color: #666; font-size: 14px;">
+                    별표로 저장한 중요한 메시지를 확인할 수 있습니다.
+                </p>
+                <button class="success" onclick="loadStarredMessages()">🔄 새로고침</button>
+            </div>
+            <div id="starredList" style="margin-top: 20px;">
+                <p style="text-align: center; color: #999; padding: 40px;">저장된 중요 메시지가 없습니다.</p>
             </div>
         </div>
 
@@ -1625,7 +1640,13 @@
                         <span class="reason">${data.reason}</span>
                         ${priorityBadge}
                     </div>
-                    ${linkButton}
+                    <div style="display: flex; gap: 8px;">
+                        <button class="star-btn" onclick="event.stopPropagation(); toggleStar('${notifId}', ${JSON.stringify(data)})"
+                                id="star-${notifId}"
+                                title="중요 메시지로 저장"
+                                style="background: transparent; border: none; font-size: 20px; cursor: pointer; padding: 4px 8px;">☆</button>
+                        ${linkButton}
+                    </div>
                 </div>
                 <div><strong>${data.user}</strong>: ${data.text}</div>
                 ${priorityReasonText}
@@ -1926,6 +1947,11 @@
                 loadKeywords();
                 loadSettings();
             }
+
+            // 중요 메시지 탭으로 전환 시 별표 메시지 로드
+            if (tabName === 'starred') {
+                loadStarredMessages();
+            }
         }
 
         // 설정 저장
@@ -2064,6 +2090,154 @@
         window.onload = function() {
             // 저장된 토큰이 있으면 자동 연결 시도 (선택사항)
         };
+
+        // ===== 별표 메시지 관련 함수 =====
+
+        // 별표 메시지 로드
+        async function loadStarredMessages() {
+            try {
+                const response = await fetch('/api/starred');
+                const data = await response.json();
+
+                if (data.success) {
+                    const starredList = document.getElementById('starredList');
+
+                    if (data.messages && data.messages.length > 0) {
+                        starredList.innerHTML = '';
+                        data.messages.forEach(msg => {
+                            starredList.appendChild(createStarredMessageCard(msg));
+                        });
+                    } else {
+                        starredList.innerHTML = '<p style="text-align: center; color: #999; padding: 40px;">저장된 중요 메시지가 없습니다.</p>';
+                    }
+                } else {
+                    console.error('별표 메시지 로드 실패:', data.error);
+                }
+            } catch (error) {
+                console.error('별표 메시지 로드 오류:', error);
+            }
+        }
+
+        // 별표 메시지 카드 생성
+        function createStarredMessageCard(msg) {
+            const card = document.createElement('div');
+            card.className = 'notification-card';
+            card.style.backgroundColor = '#fffef5';
+            card.style.borderLeft = '4px solid #ffc107';
+
+            const time = new Date(msg.starred_at * 1000).toLocaleString('ko-KR');
+
+            card.innerHTML = `
+                <div style="display: flex; justify-content: space-between; align-items: start;">
+                    <div style="flex: 1;">
+                        <div style="font-weight: 600; margin-bottom: 5px;">${msg.channel_name || 'Unknown Channel'}</div>
+                        <div style="color: #666; font-size: 13px; margin-bottom: 8px;">${msg.user || 'Unknown User'}</div>
+                        <div style="margin-bottom: 8px;">${escapeHtml(msg.text || '')}</div>
+                        <div style="color: #999; font-size: 12px;">⭐ 저장: ${time}</div>
+                    </div>
+                    <button class="delete" onclick="removeStarred('${msg.message_id}')" style="margin-left: 10px;">🗑️</button>
+                </div>
+            `;
+
+            return card;
+        }
+
+        // 별표 추가
+        async function addStarred(messageData) {
+            try {
+                const response = await fetch('/api/starred', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ message: messageData })
+                });
+
+                const data = await response.json();
+
+                if (data.success) {
+                    console.log('별표 추가됨:', data.message);
+                    return true;
+                } else {
+                    console.error('별표 추가 실패:', data.error);
+                    return false;
+                }
+            } catch (error) {
+                console.error('별표 추가 오류:', error);
+                return false;
+            }
+        }
+
+        // 별표 제거
+        async function removeStarred(messageId) {
+            if (!confirm('이 메시지의 별표를 제거하시겠습니까?')) {
+                return;
+            }
+
+            try {
+                const response = await fetch(`/api/starred/${messageId}`, {
+                    method: 'DELETE'
+                });
+
+                const data = await response.json();
+
+                if (data.success) {
+                    console.log('별표 제거됨');
+                    loadStarredMessages(); // 목록 새로고침
+                } else {
+                    alert('별표 제거 실패: ' + data.error);
+                }
+            } catch (error) {
+                console.error('별표 제거 오류:', error);
+                alert('별표 제거 중 오류가 발생했습니다.');
+            }
+        }
+
+        // HTML 이스케이프 함수 (이미 있으면 제거해도 됨)
+        function escapeHtml(text) {
+            const map = {
+                '&': '&amp;',
+                '<': '&lt;',
+                '>': '&gt;',
+                '"': '&quot;',
+                "'": '&#039;'
+            };
+            return text.replace(/[&<>"']/g, m => map[m]);
+        }
+
+        // 별표 토글
+        async function toggleStar(notifId, data) {
+            const starBtn = document.getElementById(`star-${notifId}`);
+            const isStarred = starBtn.textContent === '⭐';
+
+            if (isStarred) {
+                // 별표 제거 - 아직 message_id가 없으므로 다른 방식으로 처리
+                console.log('별표 제거는 중요 메시지 탭에서 가능합니다.');
+                return;
+            }
+
+            // 별표 추가
+            const messageData = {
+                channel_id: data.channel_id || '',
+                channel_name: data.channel || '',
+                ts: data.ts || '',
+                user: data.user || '',
+                text: data.text || '',
+                time: data.time || '',
+                reason: data.reason || '',
+                priority: data.priority || 'normal'
+            };
+
+            const success = await addStarred(messageData);
+
+            if (success) {
+                starBtn.textContent = '⭐';
+                starBtn.style.color = '#ffc107';
+                console.log('⭐ 중요 메시지로 저장되었습니다');
+            } else {
+                console.error('별표 추가 실패');
+            }
+        }
 
         // 페이지 떠날 때 정리
         window.onbeforeunload = function() {

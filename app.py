@@ -208,6 +208,29 @@ def get_user_priority_keywords(bot_id):
     # 기본 키워드 반환
     return PRIORITY_KEYWORDS.copy()
 
+def load_user_starred_messages(bot_id):
+    """사용자별 별표 메시지 로드"""
+    filepath = get_user_file_path(bot_id, 'starred_messages.json')
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"⚠️ starred_messages 로드 실패 ({bot_id}): {e}", flush=True)
+            return []
+    return []
+
+def save_user_starred_messages(bot_id, starred_messages):
+    """사용자별 별표 메시지 저장"""
+    filepath = get_user_file_path(bot_id, 'starred_messages.json')
+    try:
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(starred_messages, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        print(f"⚠️ starred_messages 저장 실패 ({bot_id}): {e}", flush=True)
+        return False
+
 # 우선순위 분류 함수
 def classify_message_by_keywords(text, keywords=None):
     """키워드 기반 빠른 우선순위 분류"""
@@ -1802,6 +1825,67 @@ def update_settings():
 
     if save_user_settings(bot_id, settings):
         return jsonify({"success": True, "settings": settings})
+    else:
+        return jsonify({"success": False, "error": "저장 실패"})
+
+# ===== 별표 메시지 API =====
+@app.route('/api/starred', methods=['GET'])
+def get_starred_messages():
+    """사용자별 별표 메시지 조회"""
+    bot_id = session.get('bot_id')
+    if not bot_id:
+        return jsonify({"success": False, "error": "연결되지 않음"})
+
+    starred_messages = load_user_starred_messages(bot_id)
+    return jsonify({"success": True, "messages": starred_messages})
+
+@app.route('/api/starred', methods=['POST'])
+def add_starred_message():
+    """별표 메시지 추가"""
+    bot_id = session.get('bot_id')
+    if not bot_id:
+        return jsonify({"success": False, "error": "연결되지 않음"})
+
+    data = request.json
+    message = data.get('message')
+
+    if not message:
+        return jsonify({"success": False, "error": "메시지 데이터 없음"})
+
+    # 기존 별표 메시지 로드
+    starred_messages = load_user_starred_messages(bot_id)
+
+    # 메시지 ID 생성 (channel_id + ts)
+    message_id = f"{message.get('channel_id', '')}_{message.get('ts', '')}"
+    message['message_id'] = message_id
+    message['starred_at'] = time.time()
+
+    # 중복 체크 (이미 별표한 메시지인지)
+    if not any(msg.get('message_id') == message_id for msg in starred_messages):
+        starred_messages.append(message)
+
+        if save_user_starred_messages(bot_id, starred_messages):
+            return jsonify({"success": True, "message": "별표 추가됨"})
+        else:
+            return jsonify({"success": False, "error": "저장 실패"})
+    else:
+        return jsonify({"success": True, "message": "이미 별표된 메시지"})
+
+@app.route('/api/starred/<message_id>', methods=['DELETE'])
+def remove_starred_message(message_id):
+    """별표 메시지 제거"""
+    bot_id = session.get('bot_id')
+    if not bot_id:
+        return jsonify({"success": False, "error": "연결되지 않음"})
+
+    # 기존 별표 메시지 로드
+    starred_messages = load_user_starred_messages(bot_id)
+
+    # 메시지 제거
+    starred_messages = [msg for msg in starred_messages if msg.get('message_id') != message_id]
+
+    if save_user_starred_messages(bot_id, starred_messages):
+        return jsonify({"success": True, "message": "별표 제거됨"})
     else:
         return jsonify({"success": False, "error": "저장 실패"})
 
